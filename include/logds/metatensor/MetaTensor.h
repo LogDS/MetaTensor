@@ -661,6 +661,52 @@ public:
         return this->storage.flatten()[idx].item<float>();
     }
 
+    // =============================================================================
+    // OPERATORE UNARIO UNIFICATO DI CELLA (Polimorfismo statico C++26)
+    // =============================================================================
+    // Applica una trasformazione unaria element-wise selezionata tramite parametro di template enum.
+    // Esempio d'uso: auto Y = tensor.template apply<CellOp::Sigmoid>();
+    template <CellOp Op>
+    auto apply() const {
+        // Verifica di sicurezza preventiva sullo stato della VRAM
+        if (!this->storage.defined()) {
+            throw std::runtime_error("[ERR_UNARY] Impossibile applicare un operatore unario a un tensore vuoto.");
+        }
+
+        torch::Tensor result_storage;
+
+        // Il compilatore ottimizza questo switch rimuovendo i rami non utilizzati nel binario finale
+        if constexpr (Op == CellOp::Sigmoid) {
+            result_storage = torch::sigmoid(this->storage);
+        }
+        else if constexpr (Op == CellOp::Logit) {
+            // logit(x) = log(x / (1 - x))
+            result_storage = torch::logit(this->storage);
+        }
+        else if constexpr (Op == CellOp::Exp) {
+            result_storage = torch::exp(this->storage);
+        }
+        else if constexpr (Op == CellOp::Log) {
+            result_storage = torch::log(this->storage);
+        }
+        else if constexpr (Op == CellOp::Tanh) {
+            result_storage = torch::tanh(this->storage);
+        }
+        else if constexpr (Op == CellOp::Abs) {
+            result_storage = torch::abs(this->storage);
+        }
+        else if constexpr (Op == CellOp::Sqrt) {
+            result_storage = torch::sqrt(this->storage);
+        }
+        else if constexpr (Op == CellOp::Square) {
+            result_storage = this->storage * this->storage;
+        }
+
+        // Mantiene intatto il layout di memoria originale (Dense o Sparse) e le dimensioni statiche
+        return MetaTensor<T, Layout, Dims...>(result_storage);
+    }
+
+
 public:
     // =============================================================================
     // 12. QUANTIFICATORE ESISTENZIALE GENERALIZZATO (∃ Axes : Predicate(cell))
