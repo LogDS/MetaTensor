@@ -304,6 +304,108 @@ TEST_CASE("Validazione Operatori Generalizzati", "[ex+agg]")  {
 
 }
 
+TEST_CASE("Validazione Operatori Generalizzati e Valori", "[ex+agg]") {
+    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+
+    // 1. Inizializziamo un tensore compatto interamente a ZERO per avere il controllo totale dei dati
+    // Dimensioni: [Batch=2, Rows=3, Cols=2, Channels=2] -> 24 elementi totali
+    MetaTensor<float, 2, 3, 2, 2> Z( device, InitPattern::Zeros);
+
+    // =========================================================================
+    // INIEZIONE CHIRURGICA DEI DATI (Uso degli indici multidimensionali)
+    // =========================================================================
+    // Iniettiamo valori che attiveranno la maschera condizionale (cell > 1.5 o cell < -1.5)
+    // Ricorda: l'esistenziale ridurrà l'asse 1 (Rows=3) e l'asse 2 (Cols=2)
+    Z[std::array<size_t, 4>{0, 1, 0, 0}] = 2.0f;   // Attiva la cella per Batch=0, Channel=0
+    Z[std::array<size_t, 4>{1, 2, 1, 1}] = -3.0f;  // Attiva la cella per Batch=1, Channel=1
+
+    // Prepariamo anche una cella per il test di aggregazione (PRODUCT)
+    // Impostiamo l'intera colonna/complemento per una determinata coordinata trattenuta
+    // Vogliamo che l'aggregazione su (Batch=0, Cols=1) moltiplichi dei valori specifici
+    // Gli assi da contrarre sono l'asse 1 (Rows) e l'asse 3 (Channels)
+    Z[std::array<size_t, 4>{0, 0, 1, 0}] = 2.0f;
+    Z[std::array<size_t, 4>{0, 1, 1, 0}] = 3.0f;
+    Z[std::array<size_t, 4>{0, 2, 1, 0}] = 1.0f;
+    // Tutte le altre celle non toccate rimangono a 0.0f grazie a InitPattern::Zeros
+
+    // =========================================================================
+    // TEST 1: Quantificatore Esistenziale Multi-Asse Generalizzato (∃)
+    // =========================================================================
+    // Riduciamo contemporaneamente l'asse 1 e l'asse 2.
+    // Tipo atteso: MetaTensor<float, 2, 2> (ovvero Batch e Channels rimasti)
+    auto exists_graph = Z.template evaluate_existential<1, 2>([](const torch::Tensor& cell) {
+        return (cell > 1.5f) | (cell < -1.5f);
+    });
+
+    // Convalida formale dei metatipi
+    STATIC_REQUIRE(decltype(exists_graph)::Rank == 2);
+    STATIC_REQUIRE(decltype(exists_graph)::Shape[0] == 2);
+    STATIC_REQUIRE(decltype(exists_graph)::Shape[1] == 2);
+
+    // Convalida Matematica dei Valori a runtime
+    auto cpu_exists = exists_graph.to_host();
+    auto val1 = cpu_exists[std::array<size_t, 2>{0, 0}];
+    auto val2 = cpu_exists[std::array<size_t, 2>{0, 1}];
+    auto val3 = cpu_exists[std::array<size_t, 2>{1, 0}];
+    auto val4 = cpu_exists[std::array<size_t, 2>{1, 1}];
+
+    // Per Batch=0, Channel=0 -> Esiste l'elemento 2.0f (iniettato in {0,1,0,0}) -> Deve essere 1.0f (True)
+    REQUIRE_THAT(val1, Catch::Matchers::WithinAbs(1.0f, 1e-5f));
+
+    // Per Batch=0, Channel=1 -> Nessun elemento attivante inserito -> Deve essere 0.0f (False)
+    REQUIRE_THAT(val2, Catch::Matchers::WithinAbs(0.0f, 1e-5f));
+
+    // Per Batch=1, Channel=0 -> Nessun elemento attivante inserito -> Deve essere 0.0f (False)
+    REQUIRE_THAT(val3, Catch::Matchers::WithinAbs(0.0f, 1e-5f));
+
+    // Per Batch=1, Channel=1 -> Esiste l'elemento -3.0f (iniettato in {1,2,1,1}) -> Deve essere 1.0f (True)
+    REQUIRE_THAT(val4, Catch::Matchers::WithinAbs(1.0f, 1e-5f));
+
+    // =========================================================================
+    // TEST 2: Operatore di Aggregazione Relazionale Complementare (PRODUCT)
+    // =========================================================================
+    // Tratteniamo l'asse 0 (Batch=2) e l'asse 2 (Cols=2).
+    // Gli assi complemento contratti sono l'asse 1 (Rows=3) e l'asse 3 (Channels=2).
+    // Tipo atteso: MetaTensor<float, 2, 2>
+    auto aggregated_graph = Z.template aggregate<0, 2>(decltype(Z)::AggregationOp::PRODUCT);
+
+    STATIC_REQUIRE(decltype(aggregated_graph)::Rank == 2);
+    STATIC_REQUIRE(decltype(aggregated_graph)::Shape[0] == 2);
+    STATIC_REQUIRE(decltype(aggregated_graph)::Shape[1] == 2);
+
+    auto cpu_agg = aggregated_graph.to_host();
+
+    // Ragionamento sul prodotto delle celle coordinate per {Batch=0, Col=1}:
+    // Gli elementi lungo gli assi controllati sono:
+    // {0,0,1,0}=2.0, {0,0,1,1}=0.0, {0,1,1,0}=3.0, {0,1,1,1}=0.0, {0,2,1,0}=1.0, {0,2,1,1}=0.0
+    // Poiché ci sono degli zeri strutturali non toccati dall'inizializzazione,
+    // il prodotto totale della contrazione di quella specifica fetta relazionale deve collassare a 0.0f
+    REQUIRE_THAT((cpu_agg[std::array<size_t, 2>{0, 1}]), Catch::Matchers::WithinAbs(0.0f, 1e-5f));
+
+    // Cambiamo approccio per verificare una riduzione moltiplicativa pulita priva di zeri:
+    // Riempiamo un micro-tensore interamente a 2.0f per testare la riduzione geometrica pura
+    MetaTensor<float, 2, 2, 2, 1> Ones_Tensor(device, InitPattern::OnOnes);
+    auto Double_Tensor = Ones_Tensor * 2.0f; // Ogni cella fisica vale 2.0f
+
+    // Tratteniamo solo l'asse 0 (Dim=2) e l'asse 3 (Dim=1). Gli assi contratti sono l'asse 1 (Dim=2) e l'asse 2 (Dim=2)
+    // Numero di elementi contratti per ogni combinazione: 2 * 2 = 4 elementi.
+    // Calcolo atteso: 2.0f ^ 4 = 16.0f
+    auto prod_check = Double_Tensor.template aggregate<0, 3>(decltype(Double_Tensor)::AggregationOp::PRODUCT);
+    auto cpu_prod_check = prod_check.to_host();
+
+    REQUIRE_THAT((cpu_prod_check[std::array<size_t, 2>{0, 0}]), Catch::Matchers::WithinAbs(16.0f, 1e-5f));
+    REQUIRE_THAT((cpu_prod_check[std::array<size_t, 2>{1, 0}]), Catch::Matchers::WithinAbs(16.0f, 1e-5f));
+
+    // Cleanup deterministico hardware Zero-Caching
+    Z.clear();
+    Ones_Tensor.clear();
+    Double_Tensor.clear();
+    exists_graph.clear();
+    aggregated_graph.clear();
+    prod_check.clear();
+}
+
+
 #include <torch/torch.h>
 #include <logds/metatensor/MetaTensor.h>
 #include <logds/metatensor/GradientTape.h>
@@ -322,10 +424,10 @@ TEST_CASE("Validazione Operatori Unari", "[unop]")  {
     auto linear_projection = X * W;
     
     // Calcoliamo la Sigmoide element-wise sul chip grafico
-    auto Y_pred = linear_projection.template apply<CellOp::Sigmoid>();
+    auto Y_pred = linear_projection.apply<CellOp::Sigmoid>();
     
     // Se volessimo calcolare una funzione di attivazione alternativa (es: Tanh) nello stesso punto:
-    auto Y_pred_tanh = linear_projection.template apply<CellOp::Tanh>();
+    auto Y_pred_tanh = linear_projection.apply<CellOp::Tanh>();
 
     std::cout << "-> [SUCCESS] Trasformazioni unarie applicate correttamente in VRAM.\n";
     std::cout << "   Forma dell'esito Sigmoide: " << Y_pred.storage.sizes() << "\n";

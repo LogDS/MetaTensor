@@ -740,6 +740,33 @@ public:
             current_tensor = torch::any(current_tensor, /*dim=*/dim);
         }
 
+
+        // C) Ricalcoliamo il tipo di ritorno statico e convertiamo la maschera in Float numerico (i1 -> f32)
+        static constexpr auto out_shape = compute_eliminated_shape<ReduceAxes...>();
+        auto numeric_result = current_tensor.to(torch::kFloat32);
+
+        return helper_instantiate<out_shape>(numeric_result, std::make_index_sequence<out_shape.size()>{});
+    }
+
+    template <size_t... ReduceAxes, typename PredicateLambda>
+    auto evaluate_universal(PredicateLambda&& predicate) const {
+        static_assert(sizeof...(ReduceAxes) > 0, "[ERR_QUANTIFIER] È necessario specificare almeno un asse per il quantificatore.");
+
+        // A) Generiamo la maschera booleana parallela sulla GPU applicando il predicato
+        // Esempio lambda: [](const torch::Tensor& cell) { return (cell > 0.0) | (cell < -1.0); }
+        torch::Tensor bool_mask = predicate(this->storage);
+
+        // B) Eseguiamo la riduzione ad albero logica (ANY) lungo gli assi specificati
+        std::vector<int64_t> dims_to_reduce = { static_cast<int64_t>(ReduceAxes)... };
+        torch::Tensor current_tensor = bool_mask;
+
+        // LibTorch esegue le riduzioni in ordine decrescente per preservare l'allineamento degli indici
+        std::sort(dims_to_reduce.rbegin(), dims_to_reduce.rend());
+        for (int64_t dim : dims_to_reduce) {
+            current_tensor = torch::all(current_tensor, /*dim=*/dim);
+        }
+
+
         // C) Ricalcoliamo il tipo di ritorno statico e convertiamo la maschera in Float numerico (i1 -> f32)
         static constexpr auto out_shape = compute_eliminated_shape<ReduceAxes...>();
         auto numeric_result = current_tensor.to(torch::kFloat32);
