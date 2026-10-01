@@ -18,6 +18,7 @@
 #ifndef TENSORLIBRARY_METATENSOR_H
 #define TENSORLIBRARY_METATENSOR_H
 
+#include <logds/metatensor/TensorCellProxy.h>
 #include <logds/metatensor/Init.h>
 #include <torch/torch.h>
 #include <array>
@@ -640,7 +641,25 @@ public:
         return helper_instantiate<out_shape>(this->storage * other.storage, std::make_index_sequence<out_shape.size()>{});
     }
 
+    // =============================================================================
+    // OVERLOAD OPERATOR[] MULTIDIMENSIONALE (Cell Extraction Pura)
+    // =============================================================================
 
+    // Variante Non-Const (Scrittura/Assegnazione)
+    template <size_t N>
+    requires (N == Rank) // BLOCCHING CONSTRAINT: se N != Rank, fallisce la compilazione ed evita lo Slicing!
+    TensorCellProxy<T> operator[](const std::array<size_t, N>& coords) {
+        int64_t idx = calculate_linear_index(coords);
+        return TensorCellProxy<T>{this->storage, idx};
+    }
+
+    // Variante Const (Sola Lettura)
+    template <size_t N>
+    requires (N == Rank)
+    float operator[](const std::array<size_t, N>& coords) const {
+        int64_t idx = calculate_linear_index(coords);
+        return this->storage.flatten()[idx].item<float>();
+    }
 
 private:
     template <auto const& OutShape, size_t... Is>
@@ -652,6 +671,22 @@ private:
     template <auto const& OutShape, size_t... Is>
     auto helper_instantiate(torch::Tensor t, std::index_sequence<Is...>) const {
         return MetaTensor<T, OutShape[Is]...>(t);
+    }
+
+    // Calcola l'indice lineare a tempo di esecuzione/compilazione partendo da coordinate multi-dimensionali
+    static constexpr int64_t calculate_linear_index(const std::array<size_t, Rank>& coords) {
+        int64_t linear_idx = 0;
+        int64_t stride = 1;
+
+        // RISOLUTIVO: Sostituito 'axis' con 'i' nel decremento del ciclo for
+        for (int64_t i = static_cast<int64_t>(Rank) - 1; i >= 0; --i) {
+            if (coords[i] >= Shape[i]) {
+                throw std::out_of_range("[ERR_BOUNDS] Indice fuori scala per l'asse specificato.");
+            }
+            linear_idx += coords[i] * stride;
+            stride *= Shape[i];
+        }
+        return linear_idx;
     }
 };
 

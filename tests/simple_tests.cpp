@@ -223,3 +223,33 @@ TEST_CASE("Runtime: Flusso dei Gradienti e Ottimizzazione SGD", "[autograd]") {
         }
     }
 }
+
+
+TEST_CASE("Runtime: Cell Extraction Multidimensionale via std::array", "[operators]") {
+    torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+
+    // Alloca un tensore 3D statico: MetaTensor<float, 2, 3, 4> (24 elementi totali)
+    MetaTensor<float, 2, 3, 4> T(device, InitPattern::Zeros);
+
+    SECTION("Assegnazione ed Estrazione di Celle Singole") {
+        // Definiamo le coordinate esatte corrispondenti al Rango 3
+        std::array<size_t, 3> coord_A = {0, 2, 1};
+        std::array<size_t, 3> coord_B = {1, 1, 3};
+
+        // Assegnazione in-place sulla GPU
+        T[coord_A] = 88.5f;
+        T[coord_B] = -12.0f;
+
+        // Estrazione e verifica matematica
+        float val_A = T[coord_A];
+        float val_B = T[coord_B];
+
+        REQUIRE_THAT(val_A, Catch::Matchers::WithinAbs(88.5f, 1e-5f));
+        REQUIRE_THAT(val_B, Catch::Matchers::WithinAbs(-12.0f, 1e-5f));
+    }
+
+    SECTION("Protezione contro Indici Fuori Confine (Out of Range)") {
+        std::array<size_t, 3> bad_coord = {0, 5, 1}; // L'asse 1 ha dimensione massima 3 (indici validi 0..2)
+        REQUIRE_THROWS_AS(T[bad_coord] = 1.0f, std::out_of_range);
+    }
+}

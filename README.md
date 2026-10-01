@@ -45,7 +45,7 @@ public:
     torch::Tensor storage;
 
     // Bare-Metal Constructors & RAII Cleanups
-    MetaTensor(InitPattern pattern, torch::Device device = torch::kCPU);
+    MetaTensor(torch::Device device = torch::kCPU, InitPattern pattern);
     MetaTensor(torch::Tensor t);
     void clear();
     ~MetaTensor();
