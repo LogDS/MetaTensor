@@ -46,6 +46,10 @@ public:
     static constexpr size_t Rank = sizeof...(Dims);
     static constexpr std::array<size_t, Rank> Shape = { Dims... };
     static constexpr StorageLayout layout = Layout;
+    // Inserisci in cima alla classe MetaTensor in MetaTensor.h
+    static constexpr StorageLayout layout_type_dense = StorageLayout::Dense;
+    static constexpr StorageLayout layout_type_sparse = StorageLayout::SparseCOO;
+
 
     // Il tensore di LibTorch interno ereditato
     torch::Tensor storage;

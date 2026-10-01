@@ -14,7 +14,10 @@
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
-
+/*
+ * This file is part of the MetaTensor distribution (https://github.com).
+ * Copyright (c) 2026 Giacomo Bergami, PhD
+ */
 
 #ifndef TENSORLIBRARY_GRADIENTTAPE_H
 #define TENSORLIBRARY_GRADIENTTAPE_H
@@ -26,47 +29,52 @@
 #include <cmath>
 #include <functional>
 
-// Aggiungi questo enum class in cima a GradientTape.h
-enum class DecayType { None, Step, Exponential };
+// Forward Declaration del Nastro fortemente tipizzato
+template <typename... TensorTypes> struct GradientTape;
 
 enum class OptimizerType { SGD, Momentum, Adam };
+enum class DecayType { None, Step, Exponential };
 
-// Struttura OptimizerState Estesa con iperparametri di decadimento
 struct OptimizerState {
     OptimizerType type = OptimizerType::SGD;
     std::vector<torch::Tensor> exp_avg;
     std::vector<torch::Tensor> exp_avg_sq;
     int64_t step = 0;
-
-    // Iperparametri Ottimizzatori
     float momentum_beta = 0.9f;
     float adam_beta1 = 0.9f;
     float adam_beta2 = 0.999f;
     float eps = 1e-8f;
-
-    // RISOLUTIVO: Iperparametri per il Learning Rate Decay
     DecayType decay_scheme = DecayType::None;
-    float lr_gamma = 0.95f;       // Fattore di decadimento (moltiplicatore)
-    int64_t decay_steps = 10;     // Intervallo di passi per lo Step Decay
+    float lr_gamma = 0.95f;
+    int64_t decay_steps = 10;
 };
-
 
 inline auto DefaultEarlyStop = [](float loss) -> bool {
     return std::isnan(loss) || std::isinf(loss);
 };
 
+// =============================================================================
+// CONTESTO DELL'EPOCA: Eredita i medesimi tipi del Nastro Padre
+// =============================================================================
 template <typename EarlyStopLambda, typename... TensorTypes>
 struct EpochContext {
     std::tuple<TensorTypes*...> watched_tensors;
     float learning_rate;
-    torch::Tensor* loss_storage_ptr = nullptr;
+    torch::Tensor loss_snapshot; // RISOLUTIVO: Copia shallow protetta invece del puntatore orfano
     bool* early_stop_flag = nullptr;
     EarlyStopLambda early_stop_predicate;
-    OptimizerState& opt_state; // Referenza allo stato persistente dell'ottimizzatore
+
+    GradientTape<TensorTypes...>* tape_parent_ptr = nullptr;
 
     template <typename LossTensorT>
     void feed_loss(const LossTensorT& loss_tensor) {
-        loss_storage_ptr = const_cast<torch::Tensor*>(&loss_tensor.storage);
+        // RISOLUTIVO: Eseguiamo una copia shallow del tensore di LibTorch.
+        // Questo incrementa il contatore dei riferimenti interno ad ATen,
+        // impedendo allo Zero-Caching di distruggere il grafo prima del backward.
+        if (loss_tensor.storage.defined()) {
+            loss_snapshot = loss_tensor.storage;
+        }
+
         float current_loss = static_cast<float>(loss_tensor);
         if (early_stop_predicate(current_loss)) {
             if (early_stop_flag) *early_stop_flag = true;
@@ -78,107 +86,19 @@ struct EpochContext {
         return true;
     }
 
-    // DISTRUTTORE RAII: Esegue l'aggiornamento matematico ottimizzato (Adam/Momentum/SGD)
-        // All'interno di ~EpochContext() in GradientTape.h
-    ~EpochContext() {
-        if ((early_stop_flag && *early_stop_flag) || !loss_storage_ptr || !loss_storage_ptr->defined()) {
-            return;
-        }
-
-        // 1. Backward pass globale sul grafo hardware
-        loss_storage_ptr->backward();
-        opt_state.step++;
-
-        // 2. RISOLUTIVO: Calcolo dinamico del Learning Rate Decay
-        float current_lr = learning_rate;
-        if constexpr (sizeof...(TensorTypes) > 0) { // Esegui solo se ci sono parametri da ottimizzare
-            if (opt_state.decay_scheme == DecayType::Exponential) {
-                current_lr = learning_rate * std::pow(opt_state.lr_gamma, static_cast<float>(opt_state.step));
-            }
-            else if (opt_state.decay_scheme == DecayType::Step) {
-                int64_t intervals = opt_state.step / opt_state.decay_steps;
-                current_lr = learning_rate * std::pow(opt_state.lr_gamma, static_cast<float>(intervals));
-            }
-        }
-
-                // 3. INIZIALIZZAZIONE LAZY DEI BUFFER DEI MOMENTI IN VRAM (Spostata Fuori dal Loop dei Gradienti)
-        // Questo garantisce che la dimensione del vettore rispecchi sempre il numero di parametri variadic tracciati
-        size_t num_tensors = sizeof...(TensorTypes);
-        if (opt_state.exp_avg.empty()) {
-            opt_state.exp_avg.resize(num_tensors);
-            if (opt_state.type == OptimizerType::Adam) {
-                opt_state.exp_avg_sq.resize(num_tensors);
-            }
-
-            size_t idx = 0;
-            std::apply([&](auto*... tensor_ptrs) {
-                (([&]() {
-                    if (tensor_ptrs) {
-                        opt_state.exp_avg[idx] = torch::zeros_like(tensor_ptrs->storage);
-                        if (opt_state.type == OptimizerType::Adam) {
-                            opt_state.exp_avg_sq[idx] = torch::zeros_like(tensor_ptrs->storage);
-                        }
-                    }
-                    idx++;
-                }()), ...);
-            }, watched_tensors);
-        }
-
-        // 4. Loop variadic per applicare le equazioni di aggiornamento hardware (Usa 'current_lr')
-        size_t tensor_idx = 0;
-        std::apply([&](auto*... tensor_ptrs) {
-            (([&]() {
-                // RISOLUTIVO: Anche se i gradienti simulati non sono agganciati a grafi dinamici nel test,
-                // forziamo l'aggiornamento in-place se definiti o se possiedono gradienti storici allocati
-                if (tensor_ptrs) {
-                    torch::NoGradGuard no_grad;
-
-                    // Estrarre il gradiente reale o un fallback a zero se indefinito a causa di backprop statiche
-                    torch::Tensor grad = tensor_ptrs->storage.grad();
-                    if (!grad.defined()) {
-                        grad = torch::zeros_like(tensor_ptrs->storage);
-                    }
-
-                    if (opt_state.type == OptimizerType::SGD) {
-                        tensor_ptrs->storage.sub_(grad * current_lr);
-                    }
-                    else if (opt_state.type == OptimizerType::Momentum) {
-                        opt_state.exp_avg[tensor_idx].mul_(opt_state.momentum_beta).add_(grad);
-                        tensor_ptrs->storage.sub_(opt_state.exp_avg[tensor_idx] * current_lr);
-                    }
-                    else if (opt_state.type == OptimizerType::Adam) {
-                        opt_state.exp_avg[tensor_idx].mul_(opt_state.adam_beta1).add_(grad * (1.0f - opt_state.adam_beta1));
-                        opt_state.exp_avg_sq[tensor_idx].mul_(opt_state.adam_beta2).add_(grad.pow(2) * (1.0f - opt_state.adam_beta2));
-
-                        float bias_correction1 = 1.0f - std::pow(opt_state.adam_beta1, opt_state.step);
-                        float bias_correction2 = 1.0f - std::pow(opt_state.adam_beta2, opt_state.step);
-
-                        auto step_size = current_lr / bias_correction1;
-                        auto denom = (opt_state.exp_avg_sq[tensor_idx].sqrt() / std::sqrt(bias_correction2)).add_(opt_state.eps);
-
-                        tensor_ptrs->storage.sub_((opt_state.exp_avg[tensor_idx] / denom) * step_size);
-                    }
-
-                    if (tensor_ptrs->storage.grad().defined()) {
-                        tensor_ptrs->storage.grad().zero_();
-                    }
-                }
-                tensor_idx++;
-            }()), ...);
-        }, watched_tensors);
-    }
-
-
-
-
+    ~EpochContext();
 };
 
+// =============================================================================
+// GRADIENT TAPE: Il blocco variadic viene congelato qui all'atto della creazione
+// =============================================================================
+template <typename... TensorTypes>
 struct GradientTape {
+    std::tuple<TensorTypes*...> watched_tensors; // Memorizzazione centralizzata dei puntatori
     std::vector<torch::Tensor*> watched_storages;
-    OptimizerState optimizer_state; // Stato dei momenti persistente dentro la sessione del nastro
+    OptimizerState optimizer_state;
 
-    template <typename... TensorTypes>
-    GradientTape(TensorTypes&... tensors) {
+    GradientTape(TensorTypes&... tensors) : watched_tensors(std::make_tuple(&tensors...)) {
         torch::autograd::GradMode::set_enabled(true);
         ([&]() {
             tensors.watch();
@@ -186,42 +106,167 @@ struct GradientTape {
         }(), ...);
     }
 
-    // Configura la tipologia di ottimizzatore della sessione
-    void set_optimizer(OptimizerType type) {
-        optimizer_state.type = type;
-    }
-
-    // All'interno di struct GradientTape in GradientTape.h
+    void set_optimizer(OptimizerType type) { optimizer_state.type = type; }
     void set_lr_decay(DecayType scheme, float gamma, int64_t steps = 10) {
         optimizer_state.decay_scheme = scheme;
         optimizer_state.lr_gamma = gamma;
         optimizer_state.decay_steps = steps;
     }
 
+    // Aggiornamento centralizzato: non è più una funzione template indipendente!
+        // All'interno di struct GradientTape in GradientTape.h
+    // All'interno di struct GradientTape in GradientTape.h
+    void apply_optimization_step(float base_lr) {
+        optimizer_state.step++;
+        float current_lr = base_lr;
+        if (optimizer_state.decay_scheme == DecayType::Exponential) {
+            current_lr = base_lr * std::pow(optimizer_state.lr_gamma, static_cast<float>(optimizer_state.step));
+        } else if (optimizer_state.decay_scheme == DecayType::Step) {
+            int64_t intervals = optimizer_state.step / optimizer_state.decay_steps;
+            current_lr = base_lr * std::pow(optimizer_state.lr_gamma, static_cast<float>(intervals));
+        }
+
+        size_t num_tensors = sizeof...(TensorTypes);
+        if (optimizer_state.exp_avg.empty()) {
+            optimizer_state.exp_avg.resize(num_tensors);
+            if (optimizer_state.type == OptimizerType::Adam) {
+                optimizer_state.exp_avg_sq.resize(num_tensors);
+            }
+            size_t idx = 0;
+            std::apply([&](auto*... tensor_ptrs) {
+                (([&]() {
+                    if (tensor_ptrs) {
+                        // RISOLUTIVO: Estraiamo il tipo statico del layout per evitare errori di compilazione dipendenti
+                        using CurrentTensorT = std::remove_pointer_t<decltype(tensor_ptrs)>;
+                        constexpr auto current_layout = CurrentTensorT::layout;
+
+                        if (current_layout == CurrentTensorT::layout_type_sparse && optimizer_state.type == OptimizerType::Adam) {
+                            optimizer_state.exp_avg[idx] = torch::zeros(tensor_ptrs->storage.sizes(), tensor_ptrs->storage.options().layout(torch::kStrided));
+                            optimizer_state.exp_avg_sq[idx] = torch::zeros(tensor_ptrs->storage.sizes(), tensor_ptrs->storage.options().layout(torch::kStrided));
+                        } else {
+                            optimizer_state.exp_avg[idx] = torch::zeros_like(tensor_ptrs->storage);
+                            if (optimizer_state.type == OptimizerType::Adam) {
+                                optimizer_state.exp_avg_sq[idx] = torch::zeros_like(tensor_ptrs->storage);
+                            }
+                        }
+                    }
+                    idx++;
+                }()), ...);
+            }, watched_tensors);
+        }
+
+        size_t tensor_idx = 0;
+        std::apply([&](auto*... tensor_ptrs) {
+            (([&]() {
+                if (tensor_ptrs) {
+                    torch::NoGradGuard no_grad;
+                    torch::Tensor grad = tensor_ptrs->storage.grad();
+                    if (!grad.defined()) { grad = torch::zeros_like(tensor_ptrs->storage); }
+
+                    // RISOLUTIVO: Interroghiamo la costante statica 'layout' della classe MetaTensor
+                    using CurrentTensorT = std::remove_pointer_t<decltype(tensor_ptrs)>;
+                    constexpr auto current_layout = CurrentTensorT::layout;
+
+                    // Controlliamo se il tipo sottostante corrisponde alla variante Sparse esposta dalla classe stessa
+                    // Nota: se nel tuo enum il valore è associato a decltype(tensor_ptrs)->layout, lo leggiamo in sicurezza
+                    if (tensor_ptrs->storage.is_sparse() || current_layout != CurrentTensorT::layout_type_dense) {
+
+                        if (optimizer_state.type == OptimizerType::SGD) {
+                            tensor_ptrs->storage.sub_(grad * current_lr);
+                        }
+                        else {
+                            // Protezione hardware per Adam/Momentum mista
+                            auto dense_tensor = tensor_ptrs->storage.to_dense();
+                            auto dense_grad = grad.to_dense();
+
+                            if (optimizer_state.type == OptimizerType::Momentum) {
+                                optimizer_state.exp_avg[tensor_idx].mul_(optimizer_state.momentum_beta).add_(dense_grad);
+                                dense_tensor.sub_(optimizer_state.exp_avg[tensor_idx] * current_lr);
+                            }
+                            else if (optimizer_state.type == OptimizerType::Adam) {
+                                optimizer_state.exp_avg[tensor_idx].mul_(optimizer_state.adam_beta1).add_(dense_grad * (1.0f - optimizer_state.adam_beta1));
+                                optimizer_state.exp_avg_sq[tensor_idx].mul_(optimizer_state.adam_beta2).add_(dense_grad.pow(2) * (1.0f - optimizer_state.adam_beta2));
+
+                                float bc1 = 1.0f - std::pow(optimizer_state.adam_beta1, optimizer_state.step);
+                                float bc2 = 1.0f - std::pow(optimizer_state.adam_beta2, optimizer_state.step);
+                                auto step_size = current_lr / bc1;
+                                auto denom = (optimizer_state.exp_avg_sq[tensor_idx].sqrt() / std::sqrt(bc2)).add_(optimizer_state.eps);
+
+                                dense_tensor.sub_((optimizer_state.exp_avg[tensor_idx] / denom) * step_size);
+                            }
+                            tensor_ptrs->storage = dense_tensor.to_sparse().coalesce();
+                        }
+                    }
+                    else {
+                        // Caso Standard: Tensori interamente densi nativi
+                        if (optimizer_state.type == OptimizerType::SGD) {
+                            tensor_ptrs->storage.sub_(grad * current_lr);
+                        }
+                        else if (optimizer_state.type == OptimizerType::Momentum) {
+                            optimizer_state.exp_avg[tensor_idx].mul_(optimizer_state.momentum_beta).add_(grad);
+                            tensor_ptrs->storage.sub_(optimizer_state.exp_avg[tensor_idx] * current_lr);
+                        }
+                        else if (optimizer_state.type == OptimizerType::Adam) {
+                            optimizer_state.exp_avg[tensor_idx].mul_(optimizer_state.adam_beta1).add_(grad * (1.0f - optimizer_state.adam_beta1));
+                            optimizer_state.exp_avg_sq[tensor_idx].mul_(optimizer_state.adam_beta2).add_(grad.pow(2) * (1.0f - optimizer_state.adam_beta2));
+                            float bc1 = 1.0f - std::pow(optimizer_state.adam_beta1, optimizer_state.step);
+                            float bc2 = 1.0f - std::pow(optimizer_state.adam_beta2, optimizer_state.step);
+                            auto step_size = current_lr / bc1;
+                            auto denom = (optimizer_state.exp_avg_sq[tensor_idx].sqrt() / std::sqrt(bc2)).add_(optimizer_state.eps);
+                            tensor_ptrs->storage.sub_((optimizer_state.exp_avg[tensor_idx] / denom) * step_size);
+                        }
+                    }
+
+                    if (tensor_ptrs->storage.grad().defined()) { tensor_ptrs->storage.grad().zero_(); }
+                }
+                tensor_idx++;
+            }()), ...);
+        }, watched_tensors);
+    }
+
+
     ~GradientTape() {
         for (auto* storage_ptr : watched_storages) {
-            if (storage_ptr && storage_ptr->defined()) {
-                storage_ptr->set_requires_grad(false);
-            }
+            if (storage_ptr && storage_ptr->defined()) { storage_ptr->set_requires_grad(false); }
         }
     }
 
+    // Le funzioni passano i puntatori pre-congelati nel costruttore, eliminando l'ambiguità variadic
     // VARIANTE A (Nome Esplicito): Per criteri di stop arbitrari via Lambda custom
-    template <typename EarlyStopLambda, typename... TensorTypes>
-    auto next_epoch_custom(float lr, bool& early_stop, EarlyStopLambda&& custom_predicate, TensorTypes&... tensors) {
+    template <typename EarlyStopLambda>
+    auto next_epoch_custom(float lr, bool& early_stop, EarlyStopLambda&& custom_predicate) {
+        // RISOLUTIVO: Rimosso 'nullptr' per loss_snapshot.
+        // Venendo omesso, torch::Tensor si inizializza automaticamente come istanza vuota/indefinita.
         return EpochContext<std::decay_t<EarlyStopLambda>, TensorTypes...>{
-            std::make_tuple(&tensors...), lr, nullptr, &early_stop, std::forward<EarlyStopLambda>(custom_predicate), optimizer_state
+            watched_tensors, lr, torch::Tensor(), &early_stop, std::forward<EarlyStopLambda>(custom_predicate), this
         };
     }
 
     // VARIANTE B (Nome Standard): Fallback automatico con DefaultEarlyStop (NaN/Inf)
-    // RISOLUTIVO: Non c'è più ambiguità di overload sui parametri variadic!
-    template <typename... TensorTypes>
-    auto next_epoch(float lr, bool& early_stop, TensorTypes&... tensors) {
+    auto next_epoch(float lr, bool& early_stop) {
+        // RISOLUTIVO: Rimosso 'nullptr' per loss_snapshot.
         return EpochContext<decltype(DefaultEarlyStop), TensorTypes...>{
-            std::make_tuple(&tensors...), lr, nullptr, &early_stop, DefaultEarlyStop, optimizer_state
+            watched_tensors, lr, torch::Tensor(), &early_stop, DefaultEarlyStop, this
         };
     }
 };
+
+// Implementazione differita del distruttore ancorata alla classe unificata
+template <typename EarlyStopLambda, typename... TensorTypes>
+EpochContext<EarlyStopLambda, TensorTypes...>::~EpochContext() {
+    // RISOLUTIVO: Controlliamo se la snapshot interna è definita e valida
+    if ((early_stop_flag && *early_stop_flag) || !loss_snapshot.defined()) {
+        return;
+    }
+
+    // 1. Il backward pass viene eseguito sulla snapshot protetta in VRAM
+    loss_snapshot.backward();
+
+    // 2. Invocazione in-place sul nastro padre
+    if (tape_parent_ptr) {
+        tape_parent_ptr->apply_optimization_step(learning_rate);
+    }
+}
+
 
 #endif //TENSORLIBRARY_GRADIENTTAPE_H

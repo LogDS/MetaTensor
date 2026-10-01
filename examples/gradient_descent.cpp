@@ -66,36 +66,18 @@ int main() {
 
     for (int epoch = 1; epoch <= max_epochs; ++epoch) {
         float host_loss_value = 0.0f;
-
-        // Il blocco if innesca l'EpochContext associato allo stato dei momenti di Adam
-        if (auto epoch_context = tape.next_epoch(learning_rate, early_stopping_triggered, W)) {
-
+        if (auto epoch_context = tape.next_epoch(learning_rate, early_stopping_triggered)) {
             auto Y_pred = (X * W).element_wise_sigmoid();
-            auto error = Y_pred - Y_true;
-            auto square_error = error.element_wise_mul(error);
-            auto loss = square_error.reduce_all_sum();
-
-            host_loss_value = loss;
+            auto loss = (Y_pred - Y_true).element_wise_mul(Y_pred - Y_true).reduce_all_sum();
             epoch_context.feed_loss(loss);
-
             std::stringstream ss;
             ss << "Epoch " << epoch << "/" << max_epochs << " | Loss: " << std::fixed << std::setprecision(6) << host_loss_value;
             bar.set_option(indicators::option::PostfixText{ss.str()});
-
-        }
-        else {
+        } else {
             bar.set_option(indicators::option::PostfixText{"[FAILED] Early Stop scattato!"});
             break;
         }
-
         bar.tick();
-
-        if (host_loss_value < convergence_threshold) {
-            std::stringstream ss;
-            ss << "[CONVERGED] Target Adam raggiunto all'epoca " << epoch << " | Loss: " << host_loss_value;
-            bar.set_option(indicators::option::PostfixText{ss.str()});
-            break;
-        }
     }
 
     bar.mark_as_completed();

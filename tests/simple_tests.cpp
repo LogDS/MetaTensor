@@ -181,22 +181,21 @@ TEST_CASE("Runtime: Flusso dei Gradienti e Ottimizzazione Avanzata", "[autograd]
 
         // RISOLUTIVO: Scope locale isolato {} per forzare la distruzione dell'EpochContext
         {
-            if (auto epoch_context = tape.next_epoch(learning_rate, early_stopping_triggered, W, b)) {
+            {
+                if (auto epoch_context = tape.next_epoch(learning_rate, early_stopping_triggered)) {
 
-                // Forward Pass completo: Y_pred = (X * W) + b
-                auto Y_pred = (X * W) + b;
-                auto error = Y_pred - Y_true;
-                auto square_error = error.element_wise_mul(error);
+                    auto Y_pred = (X * W) + b;
+                    auto error = Y_pred - Y_true;
+                    auto square_error = error.element_wise_mul(error);
+                    auto loss_scalar = square_error.reduce_all_sum();
 
-                // Riduzione totale a scalare 0-D puro (Rank = 0)
-                auto loss_scalar = square_error.reduce_all_sum();
+                    // FONDAMENTALE: Nutriamo subito il contesto dell'epoca per blindare lo storage
+                    epoch_context.feed_loss(loss_scalar);
 
-                float host_loss = loss_scalar;
-                std::cout << "Loss di test Momentum: " << host_loss << "\n";
-
-                // Alimentiamo la loss per far scattare l'ottimizzazione fusa
-                epoch_context.feed_loss(loss_scalar);
-
+                    // Ora il cast può avvenire in sicurezza senza compromettere il distruttore
+                    float host_loss = loss_scalar;
+                    std::cout << "Loss dell'epoca di test: " << host_loss << "\n";
+                }
             } // <--- Qui finisce lo scope dell'if, ma epoch_context morirebbe solo alla fine della riga successiva
         } // <--- LA GRAFFA DEL CONTESTO LOCALE SI CHIUDE QUI!
           // Ora l'oggetto epoch_context è GARANTITO essere distrutto al 100%.
