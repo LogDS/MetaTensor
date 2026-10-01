@@ -1,7 +1,8 @@
 # src/py/metatensor_py/metatensor.py
 import torch
-# Importazione dell'estensione privata annidata
-from metatensor_core import metatensor_core
+# RISOLUTIVO: Importiamo metatensor_core in modo relativo all'interno
+# del pacchetto per attingere all'unico modulo inizializzato da __init__.py
+from . import metatensor_core
 
 InitPattern = metatensor_core.InitPattern
 
