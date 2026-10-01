@@ -304,3 +304,40 @@ int main() {
 
     return 0;
 }
+
+#include <torch/torch.h>
+#include <logds/metatensor/MetaTensor.h>
+#include <logds/metatensor/GradientTape.h>
+#include <logds/metatensor/CellOp.h>
+#include <iostream>
+
+int main() {
+    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+    std::cout << "=== Verifica Operatore Unario Unificato MetaTensor ===\n\n";
+
+    MetaTensor<float, StorageLayout::Dense, 128, 64> X(InitPattern::RandomUniform, device);
+    MetaTensor<float, StorageLayout::Dense, 64, 1>   W(InitPattern::Zeros, device);
+
+    // 1. FORWARD PASS PULITO ED UNIFICATO
+    // Invece di chiamare metodi hardcoded, indichiamo l'operazione tramite l'enum
+    auto linear_projection = X * W;
+    
+    // Calcoliamo la Sigmoide element-wise sul chip grafico
+    auto Y_pred = linear_projection.template apply<CellOp::Sigmoid>();
+    
+    // Se volessimo calcolare una funzione di attivazione alternativa (es: Tanh) nello stesso punto:
+    auto Y_pred_tanh = linear_projection.template apply<CellOp::Tanh>();
+
+    std::cout << "-> [SUCCESS] Trasformazioni unarie applicate correttamente in VRAM.\n";
+    std::cout << "   Forma dell'esito Sigmoide: " << Y_pred.storage.sizes() << "\n";
+    std::cout << "   Forma dell'esito Tanh:     " << Y_pred_tanh.storage.sizes() << "\n";
+
+    // Pulizia Zero-Caching
+    X.clear();
+    W.clear();
+    Y_pred.clear();
+    Y_pred_tanh.clear();
+
+    return 0;
+}
+
