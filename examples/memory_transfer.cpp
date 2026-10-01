@@ -30,7 +30,7 @@ int main() {
 
     // 2. Inizializzazione: Il tensore nasce sulla CPU (Host Memory)
     std::cout << "-> Inizializzazione Tensore su CPU...\n";
-    MetaTensor<float, 2, 4, 3> tensor_host(cpu_device);
+    DMetaTensor<float, 2, 4, 3> tensor_host(cpu_device);
     std::cout << "   Ubicazione iniziale: " << tensor_host.storage.device() << "\n\n";
 
     // 3. OFFLOADING VERSO LA GPU: Spingiamo il tensore in VRAM per la computazione

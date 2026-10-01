@@ -25,21 +25,27 @@
 #include <array>
 #include <iostream>
 #include <utility>
-#include <c10/cuda/CUDACachingAllocator.h> // Header corretto per l'allocatore C++ [1]
+#include <vector>
+#include <tuple>
+#include <c10/cuda/CUDACachingAllocator.h>
 
 #include <logds/metatensor/BroadcastShape.h>
-#include <logds/metatensor/GradientTape.h>
 #include <logds/metatensor/RelationalEinsumCompiler.h>
 
+#include <logds/metatensor/StorageLayout.h>
+
+// RISOLUTIVO: Incluso qui sotto in modo che conosca i tipi e le enumerazioni definiti sopra
+#include <logds/metatensor/GradientTape.h>
 
 // =============================================================================
 // IL WRAPPER DEL TENSORE: `MetaTensor` (Stile Eigen)
 // =============================================================================
-template <typename T, size_t... Dims>
+template <typename T, StorageLayout Layout, size_t... Dims>
 class MetaTensor {
 public:
     static constexpr size_t Rank = sizeof...(Dims);
     static constexpr std::array<size_t, Rank> Shape = { Dims... };
+    static constexpr StorageLayout layout = Layout;
 
     // Il tensore di LibTorch interno ereditato
     torch::Tensor storage;
@@ -50,41 +56,145 @@ public:
     // =============================================================================
 
     // Costruttore flessibile guidato dai Tag Hardware
-    MetaTensor(torch::Device device = torch::kCPU, InitPattern pattern = InitPattern::RandomNormal) {
+    // Costruttore flessibile guidato dai Tag Hardware con Auto-Layout Dispatching
+    MetaTensor(torch::Device device = torch::kCPU,
+               InitPattern pattern = InitPattern::RandomNormal) {
         std::vector<int64_t> torch_shape;
         for (size_t d : Shape) torch_shape.push_back(static_cast<int64_t>(d));
         auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
 
         switch (pattern) {
-            case InitPattern::RandomNormal:
-                storage = torch::randn(torch_shape, options);
-                break;
-
-            case InitPattern::RandomUniform:
-                storage = torch::rand(torch_shape, options);
-                break;
-
-            case InitPattern::Zeros:
-                storage = torch::zeros(torch_shape, options);
-                break;
-
-            case InitPattern::OnOnes:
-                storage = torch::ones(torch_shape, options);
-                break;
-
+            case InitPattern::RandomNormal:  storage = torch::randn(torch_shape, options); break;
+            case InitPattern::RandomUniform: storage = torch::rand(torch_shape, options); break;
+            case InitPattern::Zeros:         storage = torch::zeros(torch_shape, options); break;
+            case InitPattern::OnOnes:        storage = torch::ones(torch_shape, options); break;
             case InitPattern::Identity:
-                // Vincolo formale: la matrice identità (eye) richiede rigorosamente 2 dimensioni quadrate
-                assert(Rank == 2); //"[ERR_EYE] L'inizializzazione Identity (eye) è consentita solo per matrici 2D."
-                assert(Shape[0] == Shape[1]); //"[ERR_EYE] La matrice Identity deve essere strettamente quadrata (M == N)."
-
+                assert(Rank == 2);
+                assert(Shape[0] == Shape[1]);
                 storage = torch::eye(static_cast<int64_t>(Shape[0]), options);
                 break;
+        }
+
+        // RISOLUTIVO: Forza la sparsificazione immediata se richiesto dal metatipo
+        if constexpr (Layout == StorageLayout::SparseCOO) {
+            storage = storage.to_sparse().coalesce();
+        }
+    }
+
+
+    // =============================================================================
+    // REVISIONE COSTRUTTORE SPARSO COORDINATO (C++26 Tuple Monomorphization)
+    // =============================================================================
+    template <typename TupleT>
+    MetaTensor(const std::vector<TupleT>& entries,
+               const std::vector<T>& values,
+               torch::Device device = torch::kCPU) {
+        // A) Vincolo Formale a tempo di compilazione: il layout del template deve essere SparseCOO
+        static_assert(Layout == StorageLayout::SparseCOO,
+            "[ERR_LAYOUT] Questo costruttore è riservato esclusivamente ai tensori con layout StorageLayout::SparseCOO.");
+
+        // B) Vincolo di Rango: la tupla inserita deve mappare esattamente il numero di assi statici
+        static_assert(std::tuple_size_v<TupleT> == Rank,
+            "[ERR_RANK_MISMATCH] Le tuple degli indici devono avere lo stesso numero di dimensioni del Rank del MetaTensor.");
+
+        // C) Verifica di Coerenza a runtime delle dimensioni dei vettori
+        if (entries.size() != values.size()) {
+            throw std::invalid_argument("[ERR_SIZE] Il vettore delle coordinate e il vettore dei valori devono avere la stessa dimensione.");
+        }
+
+        size_t num_elements = entries.size();
+        std::vector<int64_t> torch_shape(Shape.begin(), Shape.end());
+
+        // Se non ci sono elementi, allochiamo un tensore sparso vuoto della forma geometrica corretta
+        if (num_elements == 0) {
+            auto empty_indices = torch::empty({static_cast<int64_t>(Rank), 0}, torch::kInt64);
+            auto empty_values = torch::empty({0}, torch::kFloat32);
+            storage = torch::sparse_coo_tensor(empty_indices, empty_values, torch_shape, torch::TensorOptions().device(device));
+            return;
+        }
+
+        // D) SROTOLAMENTO DELLE TUPLE IN UN BUFFER LINEARE PER IL BACKEND DI LIBTORCH
+        // LibTorch si aspetta gli indici in un layout bidimensionale [Rank, NumElementi]
+        std::vector<int64_t> flattened_indices(Rank * num_elements);
+
+        for (size_t col = 0; col < num_elements; ++col) {
+            // Sfruttiamo una lambda helper con fold expression per srotolare la tupla in modo constexpr
+            std::apply([&](const auto&... tuple_elements) {
+                size_t row = 0;
+                // Copia in-place degli indici convertendoli nell'offset lineare corretto della matrice dei blocchi
+                ((flattened_indices[(row++) * num_elements + col] = static_cast<int64_t>(tuple_elements)), ...);
+            }, entries[col]);
+        }
+
+        // E) TRASFERIMENTO BARE-METAL DEI BUFFER FISICI SUL DEVICE HARDWARE
+        // Creiamo i tensori di supporto densi per indici e valori effettuando il push in VRAM
+        auto options_idx = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+        auto options_val = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+
+        auto indices_tensor = torch::from_blob(flattened_indices.data(), {static_cast<int64_t>(Rank), static_cast<int64_t>(num_elements)}, options_idx).to(device);
+        auto values_tensor = torch::from_blob(const_cast<T*>(values.data()), {static_cast<int64_t>(num_elements)}, options_val).to(device);
+
+        // Generazione della IR del tensore sparso e coalescenza degli indici per l'ottimizzazione OpenXLA
+        storage = torch::sparse_coo_tensor(indices_tensor, values_tensor, torch_shape, torch::TensorOptions().device(device)).coalesce();
+    }
+
+    public:
+    // =============================================================================
+    // FACTORY METHOD: GENERAZIONE DA SCALARE (C++26 Compile-Time Shape Injection)
+    // =============================================================================
+    // Prende un singolo valore scalare e restituisce un MetaTensor riempito con quel valore,
+    // proiettandolo automaticamente sulle dimensioni spaziali attese (Dims...).
+    // Esempio d'uso: auto T = MetaTensor<float, 16, 32>::from_scalar(5.5f, device);
+    static auto from_scalar(T value, torch::Device device = torch::kCPU) {
+        std::vector<int64_t> torch_shape;
+        // Espansione del pacchetto variadic per raccogliere le dimensioni statiche
+        if constexpr (Rank > 0) {
+            for (size_t d : Shape) torch_shape.push_back(static_cast<int64_t>(d));
+        } else {
+            // Se Rank == 0, stiamo creando un vero scalare 0-D nativo di LibTorch
+            torch_shape = {};
+        }
+
+        // Configurazione delle opzioni di allocazione hardware
+        auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+
+        // Generiamo il tensore denso saturando le pagine di memoria con il valore passato
+        // HLO equivalente: "broadcast" dello scalare sulla griglia geometrica
+        torch::Tensor scalar_storage = torch::full(torch_shape, static_cast<float>(value), options);
+
+        // Se l'utente ha richiesto un layout SparseCOO, la saturazione con uno scalare
+        // diverso da zero distruggerebbe la parsimonia (sparsity). Forziamo quindi il tipo
+        // di ritorno a Dense per coerenza matematica, oppure a Sparse se il valore è 0.
+        if constexpr (Layout == StorageLayout::SparseCOO) {
+            if (value != 0.0f) {
+                // Ritorna la variante densa per preservare le prestazioni hardware
+                return MetaTensor<T, StorageLayout::Dense, Dims...>(scalar_storage);
+            } else {
+                // Se lo scalare è 0, possiamo instanziare un vero tensore sparso COO vuoto
+                return MetaTensor<T, StorageLayout::SparseCOO, Dims...>(scalar_storage.to_sparse());
+            }
+        } else {
+            // Caso standard: restituisce il MetaTensor denso fortemente tipizzato
+            return MetaTensor<T, StorageLayout::Dense, Dims...>(scalar_storage);
         }
     }
 
 
     // Costruttore di accoppiamento da un tensore LibTorch esistente
     MetaTensor(torch::Tensor t) : storage(t) {}
+
+    // =============================================================================
+    // METODO POLIMORFO TO_DENSE (C++26 Zero-Overhead Branching)
+    // =============================================================================
+    auto to_dense() const {
+        if constexpr (Layout == StorageLayout::Dense) {
+            // Se è già denso, restituisce una copia shallow veloce (Zero overhead)
+            return *this;
+        } else {
+            // Se è sparso, esegue la densizzazione fisica sul chip hardware (CPU o GPU)
+            return MetaTensor<T, StorageLayout::Dense, Dims...>(this->storage.to_dense());
+        }
+    }
 
 
     void watch() {
@@ -100,13 +210,13 @@ public:
     auto grad() const {
         auto g_storage = this->storage.grad();
         if (!g_storage.defined()) {
-            return MetaTensor<T, Dims...>(torch::zeros_like(this->storage));
+            return MetaTensor<T, Layout, Dims...>(torch::zeros_like(this->storage));
         }
-        return MetaTensor<T, Dims...>(g_storage);
+        return MetaTensor<T, Layout, Dims...>(g_storage);
     }
 
     // Aggiornamento SGD automatico
-    void apply_gradient_descent(const MetaTensor<T, Dims...>& gradient_tensor, float learning_rate) {
+    void apply_gradient_descent(const MetaTensor<T, Layout, Dims...>& gradient_tensor, float learning_rate) {
         torch::NoGradGuard no_grad;
         this->storage.sub_(gradient_tensor.storage * learning_rate);
         if (this->storage.grad().defined()) {
@@ -174,11 +284,6 @@ public:
         return r_shape;
     }
 
-    // 1. Element-wise Transformations
-    auto element_wise_sigmoid() const {
-        return MetaTensor<T, Dims...>(torch::sigmoid(this->storage));
-    }
-
     // 3. Axis Permutations and Transpositions
     template <size_t... Perm>
     auto permute_axes() const {
@@ -216,8 +321,7 @@ public:
     // Collassa ogni asse del tensore sommandone i componenti.
     // Restituisce un MetaTensor<T> (senza dimensioni nel template), ovvero un vero scalare 0-D.
     auto reduce_all_sum() const {
-        // torch::sum senza argomenti riduce l'intero tensore a un singolo scalare 0-D
-        return MetaTensor<T>(torch::sum(this->storage));
+        return MetaTensor<T, StorageLayout::Dense>(torch::sum(this->storage));
     }
 
     // =============================================================================
@@ -301,7 +405,7 @@ public:
         auto out = torch::zeros({static_cast<int64_t>(NumSegments), static_cast<int64_t>(Shape[1])}, this->storage.options());
         out.index_add_(0, ids_tensor, this->storage);
 
-        return MetaTensor<T, aggregated_shape[0], aggregated_shape[1]>(out);
+        return MetaTensor<T, Layout, aggregated_shape[0], aggregated_shape[1]>(out);
     }
 
     // 9. One-Hot Encoding
@@ -316,17 +420,13 @@ public:
     // 10. Multi-Dimensional Gather (Gather ND) - RIPARATO: Riceve MetaTensor di indici
     template <typename IndexTensorT>
     auto gather_nd(const IndexTensorT& indices) const {
-        static_assert(Rank == 2, "[ERR_RANK] La sorgente densa per Gather ND deve essere 2D.");
-
-        // Estraiamo il numero di indici direttamente dal tipo del template del tensore indici
-        // Risolve l'errore: NumIndices è ora noto a compile-time!
+        static_assert(Rank == 2, "[ERR_RANK] Gather ND richiede sorgente matriciale 2D.");
         constexpr size_t NumIndices = IndexTensorT::Shape[0];
 
-        auto gathered = this->storage.index({indices.storage.select(1, 0).to(torch::kInt64),
-                                             indices.storage.select(1, 1).to(torch::kInt64)});
+        auto gathered = this->to_dense().storage.index({indices.storage.select(1, 0).to(torch::kInt64),
+                                                       indices.storage.select(1, 1).to(torch::kInt64)});
 
-        static constexpr std::array<size_t, 1> out_shape = { NumIndices };
-        return MetaTensor<T, out_shape[0]>(gathered);
+        return MetaTensor<T, StorageLayout::Dense, NumIndices>(gathered);
     }
 
 
@@ -335,22 +435,18 @@ public:
     auto tensor_theta_join(const RightT& other) const {
         static_assert(Rank == 1 && RightT::Rank == 1, "[ERR_RANK] I vettori relazionali di input devono essere 1D.");
 
-        auto A_expanded = this->storage.unsqueeze(1); // Griglia [LeftDim, 1]
-        auto B_expanded = other.storage.unsqueeze(0); // Griglia [1, RightDim]
+        auto A_expanded = this->to_dense().storage.unsqueeze(1);
+        auto B_expanded = other.to_dense().storage.unsqueeze(0);
+        auto M_mask = A_expanded > B_expanded;
+        auto R_coords = torch::where(M_mask);
 
-        auto M_mask = A_expanded > B_expanded; // Calcolo della maschera booleana [LeftDim, RightDim]
-        auto R_coords = torch::where(M_mask);  // Coordinate delle tuple valide
-
-        auto materialized_coords = torch::cat({R_coords[0].unsqueeze(1), R_coords[1].unsqueeze(1)}, /*dim=*/1).to(torch::kFloat32);
-
-        // RISOLUTIVO: Calcoliamo la dimensione massima teorica a compile-time (Prodotto Cartesiano)
-        // per soddisfare la firma fissa del template ed evitare l'AttributeError a runtime.
+        auto materialized_coords = torch::cat({R_coords[0].unsqueeze(1), R_coords[1].unsqueeze(1)}, 1).to(torch::kFloat32);
         static constexpr size_t WorstCaseMaxPairs = Shape[0] * RightT::Shape[0];
 
-        // Pad del tensore dinamico per farlo combaciare perfettamente con la forma statica richiesta
+        // Il riempimento (padding) con -1.0f cancella la parsimonia: forza il metatipo DENSO
         auto padded_coords = torch::constant_pad_nd(materialized_coords, {0, 0, 0, static_cast<int64_t>(WorstCaseMaxPairs) - materialized_coords.size(0)}, -1.0);
 
-        return MetaTensor<float, WorstCaseMaxPairs, 2>(padded_coords);
+        return MetaTensor<float, StorageLayout::Dense, WorstCaseMaxPairs, 2>(padded_coords);
     }
 
     // 12. Complex Contextual Multi-Axis Tensor Expressions - RIPARATO: Rimossa la lambda locale instabile
@@ -371,18 +467,24 @@ public:
     // -------------------------------------------------------------------------
     // 1. OPERATORE + (Somma Element-wise con Auto-Broadcasting dei Tipi)
     // -------------------------------------------------------------------------
-    template <size_t... RightDims>
-    auto operator+(const MetaTensor<T, RightDims...>& other) const {
-        static constexpr auto out_shape = deduce_broadcast_shape(Shape, MetaTensor<T, RightDims...>::Shape);
+    // =============================================================================
+    // OPERATORE + POLIMORFO ELEMENT-WISE (Auto-Layout Dispatching)
+    // =============================================================================
+    template <StorageLayout RightLayout, size_t... RightDims>
+        auto operator+(const MetaTensor<T, RightLayout, RightDims...>& other) const {
+        static constexpr auto out_shape = deduce_broadcast_shape(Shape, other.Shape);
+        static_assert(out_shape[0] != 999999, "[ERR_BROADCAST] Dimensioni incompatibili per la somma!");
 
-        // Protezione formale bloccante a tempo di compilazione
-        static_assert(out_shape[0] != 999999,
-            "[ERR_BROADCAST] I tensori hanno dimensioni incompatibili per il broadcasting additivo!");
-
-        // LibTorch gestisce l'espansione dei puntatori a runtime, noi validiamo la geometria
-        return helper_instantiate<out_shape>(this->storage + other.storage, std::make_index_sequence<out_shape.size()>{});
+        // Sparso + Sparso -> Preserva lo stato Sparso (Full Outer Join delle coordinate)
+        if constexpr (Layout == StorageLayout::SparseCOO && RightLayout == StorageLayout::SparseCOO) {
+            return MetaTensor<T, StorageLayout::SparseCOO, out_shape[0], out_shape[1]>(this->storage + other.storage);
+        } else {
+            // Qualsiasi interazione con un tensore denso corrompe la parsimonia: forza l'output DENSO
+            return MetaTensor<T, StorageLayout::Dense, out_shape[0], out_shape[1]>(this->to_dense().storage + other.to_dense().storage);
+        }
     }
 
+/*
 // -------------------------------------------------------------------------
     // 1. OPERATORE * UNIVERSALE: Invocazione Automatica di Contraction
     // -------------------------------------------------------------------------
@@ -414,21 +516,61 @@ public:
             // Qui restituiamo il tipo anonimo dedotto dinamicamente per compatibilità di build:
             return MetaTensor<T, 16, 128>(raw_matmul); // Esempio coerente con le dimensioni del main
         }
+    }*/
+
+
+
+    // Moltiplicazione Matriciale Polimorfa Universale
+    template <StorageLayout RightLayout, size_t... RightDims>
+    auto operator*(const MetaTensor<T, RightLayout, RightDims...>& other) const {
+        using RightTensor = MetaTensor<T, RightLayout, RightDims...>;
+        static_assert(Shape[Rank - 1] == RightTensor::Shape[0], "[ERR_MATMUL] Dimensioni interne disallineata.");
+
+        static constexpr std::array<size_t, 2> out_shape = { Shape[0], RightTensor::Shape[1] };
+
+        // Caso accelerato nativo hardware: SparseCOO x Dense -> Dense (via torch::mm)
+        if constexpr (Layout == StorageLayout::SparseCOO && RightLayout == StorageLayout::Dense) {
+            return MetaTensor<T, StorageLayout::Dense, out_shape[0], out_shape[1]>(torch::mm(this->storage, other.storage));
+        } else {
+            // Tutti gli altri casi (inclusi Sparso x Sparso) eseguono l'auto-densificazione su VRAM
+            return MetaTensor<T, StorageLayout::Dense, out_shape[0], out_shape[1]>(torch::matmul(this->to_dense().storage, other.to_dense().storage));
+        }
     }
+
 
     // -------------------------------------------------------------------------
     // 3. OPERATORE % (Prodotto Vettoriale / Cross Product)
     // -------------------------------------------------------------------------
-    template <size_t... RightDims>
-        auto operator%(const MetaTensor<T, RightDims...>& other) const {
-        using RightTensor = MetaTensor<T, RightDims...>;
+    // =============================================================================
+    // OPERATORE %: CROSS PRODUCT UNIVERSALE (Auto-Densizzazione Hardware)
+    // =============================================================================
+    template <StorageLayout RightLayout, size_t... RightDims>
+    auto operator%(const MetaTensor<T, RightLayout, RightDims...>& other) const {
+        using RightTensor = MetaTensor<T, RightLayout, RightDims...>;
 
-        static_assert(Rank == 1 && RightTensor::Rank == 1, "[ERR_CROSS] Il Cross Product '%' richiede vettori 1D.");
+        // 1. CONVALIDA GEOMETRICA RIGIDA A TEMPO DI COMPILAZIONE
+        static_assert(Rank == 1 && RightTensor::Rank == 1,
+            "[ERR_CROSS] Il Cross Product '%' richiede vettori unidimensionali (1D).");
         static_assert(Shape[0] == 3 && RightTensor::Shape[0] == 3,
-            "[ERR_GEOMETRY] Il Cross Product è definito esclusivamente per vettori 3D (dimensione = 3)!");
+            "[ERR_GEOMETRY] Il Cross Product è definito esclusivamente per vettori nello spazio 3D (dimensione = 3)!");
 
-        // RISOLUTIVO: Utilizzo di torch::cross nativo specificando l'asse 0 del vettore 1D
-        return MetaTensor<T, 3>(torch::cross(this->storage, other.storage, /*dim=*/0));
+        // 2. DISPATCHING DEI LAYOUT A COSTO ZERO A RUNTIME
+        // Caso A: Entrambi i vettori sono già nattivamente densi
+        if constexpr (Layout == StorageLayout::Dense && RightLayout == StorageLayout::Dense) {
+            return MetaTensor<T, StorageLayout::Dense, 3>(
+                torch::cross(this->storage, other.storage, /*dim=*/0)
+            );
+        }
+        // Caso B: Almeno uno dei due vettori è sparso -> Applichiamo la densificazione transitoria
+        else {
+            auto dense_L = this->to_dense();
+            auto dense_R = other.to_dense();
+
+            // Il risultato finale viene restituito come MetaTensor Denso 3D
+            return MetaTensor<T, StorageLayout::Dense, 3>(
+                torch::cross(dense_L.storage, dense_R.storage, /*dim=*/0)
+            );
+        }
     }
 
     // =========================================================================
@@ -479,7 +621,7 @@ public:
         // HLO equivalente: "select" (se vero prendi on_tensor, altrimenti off_tensor)
         torch::Tensor result_storage = torch::where(bool_mask, on_tensor, off_tensor);
 
-        return MetaTensor<T, Dims...>(result_storage);
+        return MetaTensor<T, Layout, Dims...>(result_storage);
     }
 
     // -------------------------------------------------------------------------
@@ -488,7 +630,7 @@ public:
     // Blocca i valori del tensore all'interno dei confini [min_val, max_val]
     // Mappa la saturazione algebrica della sezione 12 del paper (clip, 0, 1)
     auto clip(float min_val = 0.0f, float max_val = 1.0f) const {
-        return MetaTensor<T, Dims...>(torch::clamp(this->storage, min_val, max_val));
+        return MetaTensor<T, Layout, Dims...>(torch::clamp(this->storage, min_val, max_val));
     }
 
         // =============================================================================
@@ -543,14 +685,14 @@ public:
     auto to_device(torch::Device target_device = torch::kCUDA) const {
         // Se il tensore si trova già sul dispositivo target, restituisce una copia shallow veloce
         if (this->storage.device() == target_device) {
-            return MetaTensor<T, Dims...>(this->storage);
+            return MetaTensor<T, Layout, Dims...>(this->storage);
         }
 
         // Trasferimento sincrono dei vettori fisici sulla memoria della GPU
         torch::Tensor gpu_storage = this->storage.to(target_device);
 
         // Restituisce un nuovo wrapper tipizzato ancorato al chip grafico
-        return MetaTensor<T, Dims...>(gpu_storage);
+        return MetaTensor<T, Layout, Dims...>(gpu_storage);
     }
 
     // =============================================================================
@@ -559,7 +701,7 @@ public:
     auto to_host() const {
         // Se è già su CPU, restituisce una copia shallow
         if (this->storage.device().type() == torch::kCPU) {
-            return MetaTensor<T, Dims...>(this->storage);
+            return MetaTensor<T, Layout, Dims...>(this->storage);
         }
 
         auto source_device_type = this->storage.device().type();
@@ -575,7 +717,7 @@ public:
         }
 
         // Restituisce il wrapper tipizzato ancorato alla CPU, pronto per I/O o Pretty Print
-        return MetaTensor<T, Dims...>(cpu_storage);
+        return MetaTensor<T, Layout, Dims...>(cpu_storage);
     }
 
         // =============================================================================
@@ -584,17 +726,17 @@ public:
 
     // 1. Moltiplicazione: Tensore * Scalare
     auto operator*(float scalar) const {
-        return MetaTensor<T, Dims...>(this->storage * scalar);
+        return MetaTensor<T, Layout, Dims...>(this->storage * scalar);
     }
 
     // 2. Addizione: Tensore + Scalare
     auto operator+(float scalar) const {
-        return MetaTensor<T, Dims...>(this->storage + scalar);
+        return MetaTensor<T, Layout, Dims...>(this->storage + scalar);
     }
 
     // 3. Sottrazione: Tensore - Scalare
     auto operator-(float scalar) const {
-        return MetaTensor<T, Dims...>(this->storage - scalar);
+        return MetaTensor<T, Layout, Dims...>(this->storage - scalar);
     }
 
     // =============================================================================
@@ -602,18 +744,18 @@ public:
     // =============================================================================
 
     // 4. Moltiplicazione: Scalare * Tensore
-    friend auto operator*(float scalar, const MetaTensor<T, Dims...>& tensor) {
-        return MetaTensor<T, Dims...>(tensor.storage * scalar);
+    friend auto operator*(float scalar, const MetaTensor<T, Layout, Dims...>& tensor) {
+        return MetaTensor<T, Layout, Dims...>(tensor.storage * scalar);
     }
 
     // 5. Addizione: Scalare + Tensore
-    friend auto operator+(float scalar, const MetaTensor<T, Dims...>& tensor) {
-        return MetaTensor<T, Dims...>(tensor.storage + scalar);
+    friend auto operator+(float scalar, const MetaTensor<T,  Layout, Dims...>& tensor) {
+        return MetaTensor<T,  Layout, Dims...>(tensor.storage + scalar);
     }
 
     // 6. Sottrazione: Scalare - Tensore (es: 1.0f - Y)
-    friend auto operator-(float scalar, const MetaTensor<T, Dims...>& tensor) {
-        return MetaTensor<T, Dims...>(scalar - tensor.storage);
+    friend auto operator-(float scalar, const MetaTensor<T, Layout, Dims...>& tensor) {
+        return MetaTensor<T, Layout, Dims...>(scalar - tensor.storage);
     }
 
     // =============================================================================
@@ -621,10 +763,11 @@ public:
     // =============================================================================
 
     // 7. Sottrazione: Tensore - Tensore (con Auto-Broadcasting speculare all'operatore +)
-    template <size_t... RightDims>
-    auto operator-(const MetaTensor<T, RightDims...>& other) const {
-        static constexpr auto out_shape = deduce_broadcast_shape(Shape, MetaTensor<T, RightDims...>::Shape);
+    template <StorageLayout RightLayout, size_t... RightDims>
+        auto operator-(const MetaTensor<T, RightLayout, RightDims...>& other) const {
+        static constexpr auto out_shape = deduce_broadcast_shape(Shape, other.Shape);
 
+        // RISOLUTIVO: Interroga l'indice 0 della sentinella restituita dall'helper
         static_assert(out_shape[0] != 999999,
             "[ERR_BROADCAST] I tensori hanno dimensioni incompatibili per la sottrazione!");
 
@@ -632,14 +775,30 @@ public:
     }
 
     // 8. Moltiplicazione Element-wise (Hadamard Product): Tensore * Tensore (Coincide con le regole del +)
-    template <size_t... RightDims>
-    auto element_wise_mul(const MetaTensor<T, RightDims...>& other) const {
-        static constexpr auto out_shape = deduce_broadcast_shape(Shape, MetaTensor<T, RightDims...>::Shape);
+    // =============================================================================
+    // MOLTIPLICAZIONE ELEMENT-WISE POLIMORFA (Prodotto di Hadamard)
+    // =============================================================================
+    template <StorageLayout RightLayout, size_t... RightDims>
+    auto element_wise_mul(const MetaTensor<T, RightLayout, RightDims...>& other) const {
+        static constexpr auto out_shape = deduce_broadcast_shape(Shape, other.Shape);
 
+        // RISOLUTIVO: Interroga l'indice 0 della sentinella restituita dall'helper
         static_assert(out_shape[0] != 999999,
             "[ERR_BROADCAST] I tensori hanno dimensioni incompatibili per il prodotto di Hadamard!");
 
-        return helper_instantiate<out_shape>(this->storage * other.storage, std::make_index_sequence<out_shape.size()>{});
+        // Caso A: Sparso * Sparso / Sparso * Denso -> LibTorch mantiene il layout SPARSO
+        // poiché lo zero del tensore sparso annulla l'elemento denso (Inner Join condizionale)
+        if constexpr (Layout == StorageLayout::SparseCOO || RightLayout == StorageLayout::SparseCOO) {
+            return MetaTensor<T, StorageLayout::SparseCOO, out_shape[0], out_shape[1]>(
+                this->storage * other.storage
+            );
+        }
+        // Caso B: Denso * Denso -> Restituisce un tensore DENSO
+        else {
+            return MetaTensor<T, StorageLayout::Dense, out_shape[0], out_shape[1]>(
+                this->storage * other.storage
+            );
+        }
     }
 
     // =============================================================================
@@ -667,48 +826,39 @@ public:
     // =============================================================================
     // Applica una trasformazione unaria element-wise selezionata tramite parametro di template enum.
     // Esempio d'uso: auto Y = tensor.template apply<CellOp::Sigmoid>();
+    // Applica una trasformazione unaria selezionando staticamente il layout di output ottimale
     template <CellOp Op>
     auto apply() const {
-        // Verifica di sicurezza preventiva sullo stato della VRAM
         if (!this->storage.defined()) {
             throw std::runtime_error("[ERR_UNARY] Impossibile applicare un operatore unario a un tensore vuoto.");
         }
 
+        // Verifica se l'operazione preserva lo zero strutturale (f(0) == 0)
+        constexpr bool preserves_zero = (Op == CellOp::Abs || Op == CellOp::Sqrt || Op == CellOp::Square || Op == CellOp::Tanh);
+        constexpr StorageLayout OutLayout = preserves_zero ? Layout : StorageLayout::Dense;
+
+        // Se l'operazione riempie gli zeri, densifichiamo preventivamente l'input per LibTorch
+        torch::Tensor base_tensor = (preserves_zero) ? this->storage : this->to_dense().storage;
         torch::Tensor result_storage;
 
-        // Il compilatore ottimizza questo switch rimuovendo i rami non utilizzati nel binario finale
-        if constexpr (Op == CellOp::Sigmoid) {
-            result_storage = torch::sigmoid(this->storage);
-        }
-        else if constexpr (Op == CellOp::Logit) {
-            // logit(x) = log(x / (1 - x))
-            result_storage = torch::logit(this->storage);
-        }
-        else if constexpr (Op == CellOp::Exp) {
-            result_storage = torch::exp(this->storage);
-        }
-        else if constexpr (Op == CellOp::Exp2) {
-            result_storage = torch::exp2(this->storage);
-        }
-        else if constexpr (Op == CellOp::Log) {
-            result_storage = torch::log(this->storage);
-        }
-        else if constexpr (Op == CellOp::Tanh) {
-            result_storage = torch::tanh(this->storage);
-        }
-        else if constexpr (Op == CellOp::Abs) {
-            result_storage = torch::abs(this->storage);
-        }
-        else if constexpr (Op == CellOp::Sqrt) {
-            result_storage = torch::sqrt(this->storage);
-        }
-        else if constexpr (Op == CellOp::Square) {
-            result_storage = this->storage * this->storage;
-        }
+        if constexpr (Op == CellOp::Sigmoid)      result_storage = torch::sigmoid(base_tensor);
+        else if constexpr (Op == CellOp::Logit)   result_storage = torch::logit(base_tensor);
+        else if constexpr (Op == CellOp::Exp)     result_storage = torch::exp(base_tensor);
+        else if constexpr (Op == CellOp::Exp2)    result_storage = torch::exp2(base_tensor);
+        else if constexpr (Op == CellOp::Log)     result_storage = torch::log(base_tensor);
+        else if constexpr (Op == CellOp::Tanh)    result_storage = torch::tanh(base_tensor);
+        else if constexpr (Op == CellOp::Abs)     result_storage = torch::abs(base_tensor);
+        else if constexpr (Op == CellOp::Sqrt)    result_storage = torch::sqrt(base_tensor);
+        else if constexpr (Op == CellOp::Square)  result_storage = base_tensor * base_tensor;
 
-        // Mantiene intatto il layout di memoria originale (Dense o Sparse) e le dimensioni statiche
-        return MetaTensor<T, Dims...>(result_storage);
+        return MetaTensor<T, OutLayout, Dims...>(result_storage);
     }
+
+    // Semplificazione esplicita per la Sigmoide standard del paper
+    auto element_wise_sigmoid() const {
+        return this->template apply<CellOp::Sigmoid>();
+    }
+
 
     // Helper per verificare se un indice fa parte degli assi da ridurre
     template <std::size_t... ReduceAxes>
@@ -826,12 +976,12 @@ private:
     template <auto const& OutShape, size_t... Is>
     auto helper_return(torch::Tensor t, std::index_sequence<Is...>) const {
         // Restituisce un nuovo OpenXLA Tensor con la firma tipizzata e le dimensioni esatte proiettate
-        return MetaTensor<T, OutShape[Is]...>(t);
+        return MetaTensor<T, Layout, OutShape[Is]...>(t);
     }
 
     template <auto const& OutShape, size_t... Is>
     auto helper_instantiate(torch::Tensor t, std::index_sequence<Is...>) const {
-        return MetaTensor<T, OutShape[Is]...>(t);
+        return MetaTensor<T, Layout, OutShape[Is]...>(t);
     }
 
     // Calcola l'indice lineare a tempo di esecuzione/compilazione partendo da coordinate multi-dimensionali
@@ -894,5 +1044,12 @@ private:
     }
 
 };
+
+template <typename T, size_t... Dims>
+using DMetaTensor = MetaTensor<T, StorageLayout::Dense, Dims...>;
+
+
+template <typename T, size_t... Dims>
+using SMetaTensor = MetaTensor<T, StorageLayout::SparseCOO, Dims...>;
 
 #endif //TENSORLIBRARY_METATENSOR_H

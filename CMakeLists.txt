@@ -77,13 +77,13 @@ add_executable(gradient_descent examples/gradient_descent.cpp)
 target_link_libraries(gradient_descent "${TORCH_LIBRARIES}")
 apply_maximum_cxx_standard(gradient_descent)
 
-# --- Modulo Nanobind ---
-nanobind_add_module(metatensor_core NOMINSIZE src/cpp/logds/metatensor/bindings.cpp)
-target_link_libraries(metatensor_core PRIVATE ${TORCH_LIBRARIES})
-# RISOLUTIVO PER BAD_CAST: Forziamo la visibilità pubblica dei metatipi sui binari emessi
-set_target_properties(metatensor_core PROPERTIES
-        CXX_VISIBILITY_PRESET default
-        VISIBILITY_INLINES_HIDDEN OFF
-)
-apply_maximum_cxx_standard(metatensor_core) # Forzerà la modalità C++2c/26 abilitando i fold expression
-install(TARGETS metatensor_core LIBRARY DESTINATION .)
+## --- Modulo Nanobind ---
+#nanobind_add_module(metatensor_core NOMINSIZE src/cpp/logds/metatensor/bindings.cpp)
+#target_link_libraries(metatensor_core PRIVATE ${TORCH_LIBRARIES})
+## RISOLUTIVO PER BAD_CAST: Forziamo la visibilità pubblica dei metatipi sui binari emessi
+#set_target_properties(metatensor_core PROPERTIES
+#        CXX_VISIBILITY_PRESET default
+#        VISIBILITY_INLINES_HIDDEN OFF
+#)
+#apply_maximum_cxx_standard(metatensor_core) # Forzerà la modalità C++2c/26 abilitando i fold expression
+#install(TARGETS metatensor_core LIBRARY DESTINATION .)

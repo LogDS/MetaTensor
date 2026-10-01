@@ -27,8 +27,8 @@ int main() {
     std::cout << "=== Inizializzazione Wrapper MetaTensor (Eigen Style) ===\n";
 
     // Allocazione tensori fortemente tipizzati con dimensioni fisse nel tipo
-    MetaTensor<float, 16, 32, 64> t1(device); // Left Tensor  [Rank 3]
-    MetaTensor<float, 128, 64>    t2(device); // Right Tensor [Rank 2]
+    DMetaTensor<float, 16, 32, 64> t1(device); // Left Tensor  [Rank 3]
+    DMetaTensor<float, 128, 64>    t2(device); // Right Tensor [Rank 2]
 
     std::cout << "-> Tensore t1 [Left] instanziato con rango: " << t1.Rank << "\n";
     std::cout << "-> Tensore t2 [Right] instanziato con rango: " << t2.Rank << "\n";

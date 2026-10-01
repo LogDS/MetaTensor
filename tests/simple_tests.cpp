@@ -72,8 +72,8 @@ TEST_CASE("Runtime: Operazioni Algebriche e Relazionali Core", "[runtime]") {
     torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
 
     SECTION("Iniezione del Prodotto Matriciale Universale (Operatore *)") {
-        MetaTensor<float, 4, 8> A(device);
-        MetaTensor<float, 8, 2> B(device);
+        DMetaTensor<float, 4, 8> A(device);
+        DMetaTensor<float, 8, 2> B(device);
         
         // Riempimento deterministico per validare l'esito matematico
         A.storage = torch::ones({4, 8}, torch::device(device)) * 2.0f;
@@ -96,8 +96,8 @@ TEST_CASE("Runtime: Operazioni Algebriche e Relazionali Core", "[runtime]") {
     }
 
     SECTION("Mappatura Relazionale: Theta-Join e Materializzazione") {
-        MetaTensor<float, 4> vec_A(device);
-        MetaTensor<float, 4> vec_B(device);
+        DMetaTensor<float, 4> vec_A(device);
+        DMetaTensor<float, 4> vec_B(device);
 
         // Forziamo i valori per controllare la condizione (A_i > B_j)
         vec_A.storage = torch::tensor({1.0f, 5.0f, 2.0f, 0.0f}, torch::device(device));
@@ -128,7 +128,7 @@ TEST_CASE("Runtime: Operazioni Algebriche e Relazionali Core", "[runtime]") {
     }
 
     SECTION("Quantificatori Esistenziali Multi-Asse ed Espressioni Condizionali") {
-        MetaTensor<float, 2, 4> Z(device);
+        DMetaTensor<float, 2, 4> Z(device);
         // Impostiamo celle specifiche fuori dai confini logici della disgiunzione (Z > 0 o Z < -1)
         Z.storage = torch::tensor({{-0.5f,  2.0f, -0.2f, -0.1f}, 
                                    {-0.8f, -0.9f, -0.3f, -0.4f}}, torch::device(device));
@@ -150,86 +150,94 @@ TEST_CASE("Runtime: Operazioni Algebriche e Relazionali Core", "[runtime]") {
 }
 
 // =============================================================================
-// 3. UNIT TEST DEL FLUSSO DI BACKWARD (GRADIENT TAPE MULTI-TENSORE)
+// 3. UNIT TEST DEL FLUSSO DI BACKWARD AUTOMATIZZATO (CONTEXT-DRIVEN MULTI-TENSORE)
 // =============================================================================
 
-TEST_CASE("Runtime: Flusso dei Gradienti e Ottimizzazione SGD", "[autograd]") {
+// =============================================================================
+// 3. UNIT TEST DEL FLUSSO DI BACKWARD (GRADIENT TAPE AVANZATO MULTI-PARAMETRO)
+// =============================================================================
+
+TEST_CASE("Runtime: Flusso dei Gradienti e Ottimizzazione Avanzata", "[autograd]") {
     torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
 
-    SECTION("Tracciamento del Nastro ed Estrazione delle Tuple dei Gradienti") {
-        MetaTensor<float, 4, 2> X(device);
-        MetaTensor<float, 2, 1> W(device);
-        MetaTensor<float, 4, 1> b(device);
-        MetaTensor<float, 4, 1> Y_true(device);
+    SECTION("Tracciamento del Nastro ed Estrazione Context-Driven con Momentum") {
+        DMetaTensor<float, 4, 2> X(device);
+        DMetaTensor<float, 2, 1> W(device);
+        DMetaTensor<float, 4, 1> b(device);
+        DMetaTensor<float, 4, 1> Y_true(device);
 
         X.storage = torch::ones({4, 2}, torch::device(device));
         W.storage = torch::ones({2, 1}, torch::device(device)) * 0.5f;
         b.storage = torch::zeros({4, 1}, torch::device(device));
         Y_true.storage = torch::ones({4, 1}, torch::device(device)) * 2.0f;
 
-        // Registrazione dei parametri da ottimizzare
-        W.watch();
-        b.watch();
+        // Inizializzazione sessione ed attivazione del profilo di Momentum di coppia
+               // Inizializzazione sessione ed attivazione del profilo di Momentum di coppia
+        GradientTape tape(W, b);
+        tape.set_optimizer(OptimizerType::Momentum);
 
-        MetaTensor<float, 1, 1> loss_wrapper(device);
+        bool early_stopping_triggered = false;
+        float learning_rate = 0.1f;
 
+        // RISOLUTIVO: Scope locale isolato {} per forzare la distruzione dell'EpochContext
         {
-            GradientTape tape; // Avvio del nastro
+            if (auto epoch_context = tape.next_epoch(learning_rate, early_stopping_triggered, W, b)) {
 
-            // Forward Pass: (X * W) + b -> Prodotto matriciale universale e somma broadcast
-            auto Y_pred = (X * W) + b;
-            
-            // Calcolo Loss MSE elementare fusa ridotta a scalare
-            // Nuova sintassi C++26 pulita e convalidata dai tipi statici
-            auto error = Y_pred - Y_true;                        // Sfrutta l'operatore - element-wise [1]
-            auto square_error = error.element_wise_mul(error);    // Sfrutta il prodotto di Hadamard element-wise [1]
+                // Forward Pass completo: Y_pred = (X * W) + b
+                auto Y_pred = (X * W) + b;
+                auto error = Y_pred - Y_true;
+                auto square_error = error.element_wise_mul(error);
 
-            // 3. RISOLUTIVO: Collassiamo la matrice 4x1 a uno scalare puro (0-D)
-            // riducendo e sommando lungo l'asse 0. Il tipo diventa MetaTensor<float> (Rank = 0)
-            // CORREZIONE: Collassiamo l'intera matrice 4x1 in uno scalare puro 0-D
-            // loss_scalar diventa un tipo MetaTensor<float> con Rank == 0
-            auto loss_scalar = square_error.reduce_all_sum();
+                // Riduzione totale a scalare 0-D puro (Rank = 0)
+                auto loss_scalar = square_error.reduce_all_sum();
 
-            // 3. GRAZIE ALL'OPERATORE DI CAST IMPLICITO:
-            // loss_tensor (che è MetaTensor<float, 1>) si converte automaticamente in float!
-            float host_loss = loss_scalar;
+                float host_loss = loss_scalar;
+                std::cout << "Loss di test Momentum: " << host_loss << "\n";
 
-            std::cout << "Loss dell'epoca corrente: " << host_loss << "\n";
+                // Alimentiamo la loss per far scattare l'ottimizzazione fusa
+                epoch_context.feed_loss(loss_scalar);
 
-            // Utilizzo diretto all'interno dei costrutti logici di arresto o test di Catch2
-            if (host_loss < 1e-4f) {
-                std::cout << "Convergenza raggiunta.\n";
-            }
+            } // <--- Qui finisce lo scope dell'if, ma epoch_context morirebbe solo alla fine della riga successiva
+        } // <--- LA GRAFFA DEL CONTESTO LOCALE SI CHIUDE QUI!
+          // Ora l'oggetto epoch_context è GARANTITO essere distrutto al 100%.
+          // Il distruttore ~EpochContext() si è attivato, ha eseguito il backward globale
+          // e ha popolato i buffer storici del Momentum per ENTRAMBI i parametri sulla GPU.
 
-            // Chiamata variadic multi-tensore per estrarre la tupla statica dei gradienti
-            auto [dW, db] = tape.gradients(loss_scalar, W, b);
+        // Estraiamo i gradienti correnti per la convalida dei tipi
+        auto dW = W.grad();
+        auto db = b.grad();
 
-            // Convalida formale dei tipi delle matrici Jacobiane estratte
-            // CONVALIDA FORMALE DEI TIPI DELLE MATRICI JACOBIANE ESTRATTE
-            // RISOLUTIVO: dW deve avere la stessa identica forma dei pesi W, ovvero [2, 1]
-            STATIC_REQUIRE(decltype(dW)::Rank == 2);
-            STATIC_REQUIRE(decltype(dW)::Shape[0] == 2); // Corretto: prima dimensione pari a 2
-            STATIC_REQUIRE(decltype(dW)::Shape[1] == 1); // Corretto: seconda dimensione pari a 1
+        // CONVALIDA FORMALE DEI TIPI DELLE MATRICI JACOBIANE ESTRATTE
+        STATIC_REQUIRE(decltype(dW)::Rank == 2);
+        STATIC_REQUIRE(decltype(dW)::Shape[0] == 2);
+        STATIC_REQUIRE(decltype(dW)::Shape[1] == 1);
 
-            // db deve avere la stessa forma del bias b, ovvero [4, 1]
-            STATIC_REQUIRE(decltype(db)::Rank == 2);
-            STATIC_REQUIRE(decltype(db)::Shape[0] == 4);
-            STATIC_REQUIRE(decltype(db)::Shape[1] == 1);
+        STATIC_REQUIRE(decltype(db)::Rank == 2);
+        STATIC_REQUIRE(decltype(db)::Shape[0] == 4);
+        STATIC_REQUIRE(decltype(db)::Shape[1] == 1);
 
-            // Verifichiamo che i gradienti fisici siano stati estratti dall'Autograd
-            REQUIRE(dW.storage.defined());
-            REQUIRE(db.storage.defined());
+        // Verifichiamo che i gradienti fisici siano definiti e presenti sul dispositivo hardware
+        REQUIRE(dW.storage.defined());
+        REQUIRE(db.storage.defined());
 
-        }
+        // RISOLUTIVO: Adesso l'asserzione passerà con successo (2 == 2)!
+        REQUIRE(tape.optimizer_state.exp_avg.size() == 2);
+
+        // Cleanup finale Zero-Caching
+        X.clear(); W.clear(); b.clear(); Y_true.clear();
+        dW.clear(); db.clear();
+
     }
 }
+
+
 
 
 TEST_CASE("Runtime: Cell Extraction Multidimensionale via std::array", "[operators]") {
     torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
 
     // Alloca un tensore 3D statico: MetaTensor<float, 2, 3, 4> (24 elementi totali)
-    MetaTensor<float, 2, 3, 4> T(device, InitPattern::Zeros);
+    DMetaTensor<float, 2, 3, 4> T(device, InitPattern::Zeros);
 
     SECTION("Assegnazione ed Estrazione di Celle Singole") {
         // Definiamo le coordinate esatte corrispondenti al Rango 3
@@ -264,7 +272,7 @@ TEST_CASE("Validazione Operatori Generalizzati", "[ex+agg]")  {
     std::cout << "=== Validazione Operatori Generalizzati C++26 ===\n\n";
 
     // Un tensore 4D di partenza: [Batch=16, Rows=32, Cols=64, Channels=3]
-    MetaTensor<float, 16, 32, 64, 3> Z( device, InitPattern::RandomNormal);
+    DMetaTensor<float, 16, 32, 64, 3> Z( device, InitPattern::RandomNormal);
 
     // =========================================================================
     // TEST 1: Quantificatore Esistenziale Multi-Asse Generalizzato (∃)
@@ -289,7 +297,7 @@ TEST_CASE("Validazione Operatori Generalizzati", "[ex+agg]")  {
     // Questo significa che l'asse 1 (32) e l'asse 3 (3) costituiscono il complemento 
     // e verranno contratti effettuando una riduzione moltiplicativa (PRODUCT).
     // Tipo atteso dedotto dal compilatore: MetaTensor<float, 16, 64> (Rank = 2)
-    auto aggregated_graph = Z.aggregate<0, 2>(MetaTensor<float, 16, 32, 64, 3>::AggregationOp::PRODUCT);
+    auto aggregated_graph = Z.aggregate<0, 2>(DMetaTensor<float, 16, 32, 64, 3>::AggregationOp::PRODUCT);
 
     STATIC_REQUIRE(decltype(aggregated_graph)::Rank == 2);
     STATIC_REQUIRE(decltype(aggregated_graph)::Shape[0] == 16);
@@ -309,7 +317,7 @@ TEST_CASE("Validazione Operatori Generalizzati e Valori", "[ex+agg]") {
 
     // 1. Inizializziamo un tensore compatto interamente a ZERO per avere il controllo totale dei dati
     // Dimensioni: [Batch=2, Rows=3, Cols=2, Channels=2] -> 24 elementi totali
-    MetaTensor<float, 2, 3, 2, 2> Z( device, InitPattern::Zeros);
+    DMetaTensor<float, 2, 3, 2, 2> Z( device, InitPattern::Zeros);
 
     // =========================================================================
     // INIEZIONE CHIRURGICA DEI DATI (Uso degli indici multidimensionali)
@@ -384,7 +392,7 @@ TEST_CASE("Validazione Operatori Generalizzati e Valori", "[ex+agg]") {
 
     // Cambiamo approccio per verificare una riduzione moltiplicativa pulita priva di zeri:
     // Riempiamo un micro-tensore interamente a 2.0f per testare la riduzione geometrica pura
-    MetaTensor<float, 2, 2, 2, 1> Ones_Tensor(device, InitPattern::OnOnes);
+    DMetaTensor<float, 2, 2, 2, 1> Ones_Tensor(device, InitPattern::OnOnes);
     auto Double_Tensor = Ones_Tensor * 2.0f; // Ogni cella fisica vale 2.0f
 
     // Tratteniamo solo l'asse 0 (Dim=2) e l'asse 3 (Dim=1). Gli assi contratti sono l'asse 1 (Dim=2) e l'asse 2 (Dim=2)
@@ -416,8 +424,8 @@ TEST_CASE("Validazione Operatori Unari", "[unop]")  {
     auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
     std::cout << "=== Verifica Operatore Unario Unificato MetaTensor ===\n\n";
 
-    MetaTensor<float, 128, 64> X(device, InitPattern::RandomUniform);
-    MetaTensor<float, 64, 1>   W( device, InitPattern::Zeros);
+    DMetaTensor<float, 128, 64> X(device, InitPattern::RandomUniform);
+    DMetaTensor<float, 64, 1>   W( device, InitPattern::Zeros);
 
     // 1. FORWARD PASS PULITO ED UNIFICATO
     // Invece di chiamare metodi hardcoded, indichiamo l'operazione tramite l'enum
@@ -440,3 +448,107 @@ TEST_CASE("Validazione Operatori Unari", "[unop]")  {
     Y_pred_tanh.clear();
 }
 
+
+
+TEST_CASE("Runtime: Moltiplicazione Polimorfa con Auto-Densizzazione", "[operators+sparse]") {
+    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+
+    // Definiamo due matrici sparse tramite coordinate (Tuple 2D)
+    using IdxTuple = std::tuple<size_t, size_t>;
+    std::vector<IdxTuple> entry_A = {{0, 1}, {1, 0}};
+    std::vector<float> val_A = {2.0f, 3.0f};
+
+    std::vector<IdxTuple> entry_B = {{1, 0}, {0, 1}};
+    std::vector<float> val_B = {4.0f, 5.0f};
+
+    // Istanziamo due MetaTensor SPARSI COO
+    MetaTensor<float, StorageLayout::SparseCOO, 2, 2> A_sparse(entry_A, val_A, device);
+    MetaTensor<float, StorageLayout::SparseCOO, 2, 2> B_sparse(entry_B, val_B, device);
+
+    SECTION("Moltiplicazione Sparso x Sparso (Risolta via Auto-Densizzazione)") {
+        // Nativamente LibTorch fallirebbe. Il nostro wrapper C++26 devia sul ramo 'else'
+        // a tempo di compilazione, densifica gli operandi ed esegue il calcolo.
+        auto C_dense = A_sparse * B_sparse;
+
+        STATIC_REQUIRE(decltype(C_dense)::layout == StorageLayout::Dense);
+        STATIC_REQUIRE(decltype(C_dense)::Shape[0] == 2);
+        STATIC_REQUIRE(decltype(C_dense)::Shape[1] == 2);
+
+        auto host_C = C_dense.to_host();
+
+        // RISOLUTIVO: Allineamento con il reale esito del prodotto matriciale hardware
+        REQUIRE_THAT((host_C[std::array<size_t, 2>{0, 0}]), Catch::Matchers::WithinAbs(8.0f, 1e-5f));
+        REQUIRE_THAT((host_C[std::array<size_t, 2>{1, 1}]), Catch::Matchers::WithinAbs(15.0f, 1e-5f));
+    }
+
+    A_sparse.clear();
+    B_sparse.clear();
+}
+
+TEST_CASE("Runtime: Cross Product Polimorfo Sparso/Denso", "[operators+cross]") {
+    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+
+    // Popoliamo un vettore sparso 3D: U = [0.0, 2.0, 0.0] -> Asse Y puro
+    using IdxTuple = std::tuple<size_t>;
+    std::vector<IdxTuple> entries_U = {{1}}; // Solo indice 1 popolata
+    std::vector<float> values_U = {2.0f};
+    MetaTensor<float, StorageLayout::SparseCOO, 3> U_sparse(entries_U, values_U, device);
+
+    // Popoliamo un vettore denso 3D: V = [3.0, 0.0, 0.0] -> Asse X puro
+    MetaTensor<float, StorageLayout::Dense, 3> V_dense(device, InitPattern::Zeros);
+    V_dense[std::array<size_t, 1>{0}] = 3.0f; // Componente X = 3.0f
+
+    SECTION("Esecuzione Cross Product Misto (Sparse % Dense)") {
+        // Matematicamente: U x V = [0, 2, 0] x [3, 0, 0] = [0, 0, -6.0] -> Direzione -Z
+        // Il compilatore devia sul ramo 'else' ed esegue il calcolo senza sollevare eccezioni
+        auto W_dense = U_sparse % V_dense;
+
+        STATIC_REQUIRE(decltype(W_dense)::Rank == 1);
+        STATIC_REQUIRE(decltype(W_dense)::Shape[0] == 3);
+        STATIC_REQUIRE(decltype(W_dense)::layout == StorageLayout::Dense);
+
+        auto host_W = W_dense.to_host();
+
+        // Verifichiamo i valori estratti dalle componenti spaziali
+        REQUIRE_THAT((host_W[std::array<size_t, 1>{0}]), Catch::Matchers::WithinAbs(0.0f, 1e-5f));
+        REQUIRE_THAT((host_W[std::array<size_t, 1>{1}]), Catch::Matchers::WithinAbs(0.0f, 1e-5f));
+        REQUIRE_THAT((host_W[std::array<size_t, 1>{2}]), Catch::Matchers::WithinAbs(-6.0f, 1e-5f));
+    }
+
+    U_sparse.clear();
+    V_dense.clear();
+}
+
+TEST_CASE("Runtime: Generazione ed Espansione da Scalare", "[factory]") {
+    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+
+    SECTION("Proiezione Multidimensionale Densificata") {
+        // Generiamo una matrice 4x4 riempita interamente con il valore 7.2f
+        auto A = MetaTensor<float, StorageLayout::Dense, 4, 4>::from_scalar(7.2f, device);
+
+        STATIC_REQUIRE(decltype(A)::Rank == 2);
+        STATIC_REQUIRE(decltype(A)::Shape[0] == 4);
+        STATIC_REQUIRE(decltype(A)::Shape[1] == 4);
+
+        auto host_A = A.to_host();
+        // Verifichiamo che i confini e i valori interni siano perfettamente integrati
+        REQUIRE_THAT((host_A[std::array<size_t, 2>{0, 0}]), Catch::Matchers::WithinAbs(7.2f, 1e-5f));
+        REQUIRE_THAT((host_A[std::array<size_t, 2>{2, 3}]), Catch::Matchers::WithinAbs(7.2f, 1e-5f));
+        REQUIRE_THAT((host_A[std::array<size_t, 2>{3, 1}]), Catch::Matchers::WithinAbs(7.2f, 1e-5f));
+
+        A.clear();
+    }
+
+    SECTION("Generazione di un vero Scalare 0-D (Loss Tracking)") {
+        // Generiamo un tensore a 0 dimensioni (Rank = 0)
+        auto loss_tensor = MetaTensor<float, StorageLayout::Dense>::from_scalar(0.123f, device);
+
+        STATIC_REQUIRE(decltype(loss_tensor)::Rank == 0);
+
+        // Sfruttiamo l'operatore di cast implicito C++26 sviluppato nei passi precedenti
+        float scalar_value = loss_tensor;
+        REQUIRE_THAT(scalar_value, Catch::Matchers::WithinAbs(0.123f, 1e-5f));
+
+        loss_tensor.clear();
+    }
+}

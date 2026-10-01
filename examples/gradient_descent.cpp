@@ -1,5 +1,5 @@
 /*
- * This file is part of the MetaTensor distribution (https://github.com).
+* This file is part of the MetaTensor distribution (https://github.com/logds/MetaTensor).
  * Copyright (c) 2026 Giacomo Bergami, PhD
  *
  * This program is free software: you can redistribute it and/or modify
@@ -12,11 +12,10 @@
  * General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://gnu.org>.
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <indicators/progress_bar.hpp>
-#include <indicators/indeterminate_progress_bar.hpp>
 #include <indicators/cursor_control.hpp>
 #include <torch/torch.h>
 #include <logds/metatensor/MetaTensor.h>
@@ -29,51 +28,37 @@
 #include <sstream>
 
 int main() {
-    // Nascondiamo il cursore per evitare sfarfallii durante l'aggiornamento della barra
     indicators::show_console_cursor(false);
-
     auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
-    std::cout << "=== Orchestrazione OpenXLA/LibTorch Standard (C++26) ===\n";
-    std::cout << "=== Test Inizializzazione Pattern MetaTensor (C++26) ===\n\n";
+    std::cout << "=== Orchestrazione Avanzata con Ottimizzatore Adam (C++26) ===\n\n";
 
-    // Ottimizzazione del tasso di apprendimento per la sigmoide continua
-    float learning_rate = 0.5f;
-    constexpr int max_epochs = 50; // Aumentato a 50 per mostrare una convergenza fluida
+    // Nota: Adam richiede un tasso di apprendimento più basso rispetto a SGD puro
+    float learning_rate = 0.001f;
+    constexpr int max_epochs = 50;
     constexpr float convergence_threshold = 1e-3f;
 
-    // 1. DATASET LINEARMENTE SEPARABILE (Teacher-Student Pattern per garantire la convergenza)
-    MetaTensor<float, 128, 64> X( device, InitPattern::RandomUniform);
-    MetaTensor<float, 64, 1>   W_true( device, InitPattern::RandomNormal);
-
-    // Y_true generata in modo coerente: il modello convergerà minimizzando la Loss
+    DMetaTensor<float, 128, 64> X(device, InitPattern::RandomUniform);
+    DMetaTensor<float, 64, 1>   W_true(device, InitPattern::RandomNormal);
     auto Y_true = (X * W_true).element_wise_sigmoid();
 
-    // 2. INIZIALIZZAZIONE DEI PARAMETRI DEL MODELLO
-    MetaTensor<float, 64, 1>   W(device, InitPattern::Zeros);
+    DMetaTensor<float, 64, 1>   W(device, InitPattern::Zeros);
 
-    // Esempi opzionali aggiuntivi (strutture costanti verificate)
-    MetaTensor<float, 64, 64>  I(device, InitPattern::Identity);
-    MetaTensor<float, 64, 1>   b(device, InitPattern::Zeros);
-
-    std::cout << "-> Tutti i tensori sono stati inizializzati correttamente in VRAM.\n";
-    std::cout << "   Forma della matrice Identità verificata: " << I.storage.sizes() << "\n";
-    std::cout << "Inizio ottimizzazione sui nodi hardware...\n\n";
-
-    // 3. IL GRADIENT TAPE NASCE PRIMA DEL LOOP DELLE EPOCHE
+    // Inizializzazione del nastro ed attivazione del profilo di ottimizzazione ADAM
     GradientTape tape(W);
+    tape.set_optimizer(OptimizerType::Adam);
 
-    // Configurazione formale della barra di avanzamento indicators
+    // Configura il decadimento: Tipo Esponenziale, riduce del 5% (gamma=0.95) a ogni epoca
+    tape.set_lr_decay(DecayType::Exponential, 0.95f);
+
+    bool early_stopping_triggered = false;
+
     indicators::ProgressBar bar{
-        indicators::option::BarWidth{50},
-        indicators::option::Start{"["},
-        indicators::option::Fill{"="},
-        indicators::option::Lead{">"},
-        indicators::option::Remainder{" "},
-        indicators::option::End{"]"},
+        indicators::option::BarWidth{50}, indicators::option::Start{"["},
+        indicators::option::Fill{"="}, indicators::option::Lead{">"},
+        indicators::option::Remainder{" "}, indicators::option::End{"]"},
         indicators::option::PostfixText{"Initializing..."},
         indicators::option::ForegroundColor{indicators::Color::green},
-        indicators::option::ShowPercentage{true},
-        indicators::option::ShowElapsedTime{true},
+        indicators::option::ShowPercentage{true}, indicators::option::ShowElapsedTime{true},
         indicators::option::ShowRemainingTime{true},
         indicators::option::FontStyles{std::vector<indicators::FontStyle>{indicators::FontStyle::bold}},
         indicators::option::MaxProgress{max_epochs}
@@ -82,71 +67,42 @@ int main() {
     for (int epoch = 1; epoch <= max_epochs; ++epoch) {
         float host_loss_value = 0.0f;
 
-        // =====================================================================
-        // SCOPE LOCALE STRETTO PER LE ALLOCAZIONI DEI BUFFER TEMPORANEI
-        // =====================================================================
-        {
-            // Forward Pass fuso: usiamo la Sigmoide continua per far scorrere l'Autograd
+        // Il blocco if innesca l'EpochContext associato allo stato dei momenti di Adam
+        if (auto epoch_context = tape.next_epoch(learning_rate, early_stopping_triggered, W)) {
+
             auto Y_pred = (X * W).element_wise_sigmoid();
             auto error = Y_pred - Y_true;
             auto square_error = error.element_wise_mul(error);
-
-            // Riduzione totale a scalare puro 0-D (Rank = 0)
             auto loss = square_error.reduce_all_sum();
 
-            // Estrazione del gradiente dW tramite il nastro globale
-            auto [dW] = tape.gradients(loss, W);
-
-            // Mutazione in-place dei pesi isolata dall'Autograd
-            W.apply_gradient_descent(dW, learning_rate);
-
-            // Estrazione sicura del valore host tramite l'operatore di cast implicito C++26
             host_loss_value = loss;
+            epoch_context.feed_loss(loss);
 
-            // Formattazione della stringa Postfix per mostrare epoca e minimizzazione decimale della Loss
             std::stringstream ss;
-            ss << "Epoch " << epoch << "/" << max_epochs
-               << " | Loss: " << std::fixed << std::setprecision(6) << host_loss_value;
+            ss << "Epoch " << epoch << "/" << max_epochs << " | Loss: " << std::fixed << std::setprecision(6) << host_loss_value;
             bar.set_option(indicators::option::PostfixText{ss.str()});
 
-            // Controllo Early Stopping condizionale per instabilità dei dati
-            if (std::isnan(host_loss_value) || std::isinf(host_loss_value)) {
-                bar.set_option(indicators::option::PostfixText{"[FAILED] Instabilità numerica!"});
-                std::cerr << "\n[EARLY STOPPING] Rilevato NaN/Inf nei vettori di Loss.\n";
-                break;
-            }
         }
-        // <--- LA GRAFFA SI CHIUDE QUI!
-        // I tensori temporanei (Y_pred, error, square_error, loss, dW) escono dallo scope.
-        // Il distruttore ~MetaTensor() cancella istantaneamente i buffer svuotando la cache.
+        else {
+            bar.set_option(indicators::option::PostfixText{"[FAILED] Early Stop scattato!"});
+            break;
+        }
 
-        // Aggiornamento grafico della barra ad ogni iterazione dell'epoca
         bar.tick();
 
-        // Controllo della convergenza ottimale anticipata
         if (host_loss_value < convergence_threshold) {
             std::stringstream ss;
-            ss << "[CONVERGED] Target raggiunto all'epoca " << epoch << " | Loss: " << host_loss_value;
+            ss << "[CONVERGED] Target Adam raggiunto all'epoca " << epoch << " | Loss: " << host_loss_value;
             bar.set_option(indicators::option::PostfixText{ss.str()});
             break;
         }
     }
 
-    // Forza il completamento grafico definitivo della barra sul terminale
     bar.mark_as_completed();
-
-    // Ripristiniamo il cursore della console prima di uscire dal programma
     indicators::show_console_cursor(true);
 
-    // Svuotamento esplicito finale delle matrici e delle strutture statiche globali
-    W.clear();
-    X.clear();
-    Y_true.clear();
-    W_true.clear();
-    I.clear();
-    b.clear();
-
-    std::cout << "\nTraining completato con successo. VRAM e contesti hardware azzerati.\n";
+    W.clear(); X.clear(); Y_true.clear(); W_true.clear();
+    std::cout << "\nTraining terminato con successo.\n";
 
     return 0;
 }
