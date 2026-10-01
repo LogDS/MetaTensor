@@ -661,6 +661,85 @@ public:
         return this->storage.flatten()[idx].item<float>();
     }
 
+public:
+    // =============================================================================
+    // 12. QUANTIFICATORE ESISTENZIALE GENERALIZZATO (∃ Axes : Predicate(cell))
+    // =============================================================================
+    // Accetta un insieme variadic di assi da collassare e una lambda cell-wise.
+    // Esegue il mapping logico e riduce tramite ANY (Disgiunzione Esistenziale Multi-Asse).
+    template <size_t... ReduceAxes, typename PredicateLambda>
+    auto evaluate_existential(PredicateLambda&& predicate) const {
+        static_assert(sizeof...(ReduceAxes) > 0, "[ERR_QUANTIFIER] È necessario specificare almeno un asse per il quantificatore.");
+
+        // A) Generiamo la maschera booleana parallela sulla GPU applicando il predicato
+        // Esempio lambda: [](const torch::Tensor& cell) { return (cell > 0.0) | (cell < -1.0); }
+        torch::Tensor bool_mask = predicate(this->storage);
+
+        // B) Eseguiamo la riduzione ad albero logica (ANY) lungo gli assi specificati
+        std::vector<int64_t> dims_to_reduce = { static_cast<int64_t>(ReduceAxes)... };
+        torch::Tensor current_tensor = bool_mask;
+        
+        // LibTorch esegue le riduzioni in ordine decrescente per preservare l'allineamento degli indici
+        std::sort(dims_to_reduce.rbegin(), dims_to_reduce.rend());
+        for (int64_t dim : dims_to_reduce) {
+            current_tensor = torch::any(current_tensor, /*dim=*/dim);
+        }
+
+        // C) Ricalcoliamo il tipo di ritorno statico e convertiamo la maschera in Float numerico (i1 -> f32)
+        static constexpr auto out_shape = compute_eliminated_shape<ReduceAxes...>();
+        auto numeric_result = current_tensor.to(torch::kFloat32);
+
+        return helper_instantiate<out_shape>(numeric_result, std::make_index_sequence<out_shape.size()>{});
+    }
+
+    // =============================================================================
+    // OPERATORE DI AGGREGAZIONE RELAZIONALE GENERICA (MapReduce Step)
+    // =============================================================================
+    // Mantiene fissi ed immutati gli assi indicati in RetainedAxes..., calcola il complemento
+    // degli assi rimanenti e applica l'operazione associativa/commutativa indicata (SUM, PROD, ecc.).
+    enum class AggregationOp { SUM, PRODUCT, MIN, MAX };
+
+    template <size_t... RetainedAxes>
+    auto aggregate(AggregationOp op) const {
+        static_assert(sizeof...(RetainedAxes) > 0, "[ERR_AGGREGATE] È necessario trattenere almeno un asse.");
+
+        // Calcoliamo gli assi complemento (gli assi reali su cui effettuare la contrazione/riduzione hardware)
+        std::vector<size_t> retained_set = { RetainedAxes... };
+        std::vector<int64_t> dims_to_collapse;
+        
+        for (size_t i = 0; i < Rank; ++i) {
+            if (!is_axis_in_set(i, retained_set)) {
+                dims_to_collapse.push_back(static_cast<int64_t>(i));
+            }
+        }
+
+        // Ordiniamo a ritroso per evitare la mutazione degli indici durante il collasso sequenziale
+        std::sort(dims_to_collapse.rbegin(), dims_to_collapse.rend());
+        torch::Tensor current_tensor = this->storage;
+
+        for (int64_t dim : dims_to_collapse) {
+            switch (op) {
+                case AggregationOp::SUM:
+                    current_tensor = torch::sum(current_tensor, /*dim=*/dim);
+                    break;
+                case AggregationOp::PRODUCT:
+                    current_tensor = torch::prod(current_tensor, /*dim=*/dim);
+                    break;
+                case AggregationOp::MIN:
+                    current_tensor = std::get<0>(torch::min(current_tensor, /*dim=*/dim));
+                    break;
+                case AggregationOp::MAX:
+                    current_tensor = std::get<0>(torch::max(current_tensor, /*dim=*/dim));
+                    break;
+            }
+        }
+
+        // Calcolo automatico del metatipo risultante che conterrà esclusivamente gli assi trattenuti
+        static constexpr auto out_shape = compute_retained_shape<RetainedAxes...>();
+        return helper_instantiate<out_shape>(current_tensor, std::make_index_sequence<out_shape.size()>{});
+    }
+
+
 private:
     template <auto const& OutShape, size_t... Is>
     auto helper_return(torch::Tensor t, std::index_sequence<Is...>) const {
@@ -688,6 +767,51 @@ private:
         }
         return linear_idx;
     }
+
+private:
+    // Helper per verificare se un asse fa parte di un insieme di indici (compile-time lookup)
+    static constexpr bool is_axis_in_set(size_t axis, const std::vector<size_t>& axes_set) {
+        for (size_t a : axes_set) { if (a == axis) return true; }
+        return false;
+    }
+
+    // 1. Calcola la forma eliminando un insieme di assi (Utilizzato per l'Esistenziale e Riduzioni standard)
+    template <size_t... ReduceAxes>
+    static constexpr auto compute_eliminated_shape() {
+        std::vector<size_t> target_axes = { ReduceAxes... };
+        // Validazione preventiva bloccante
+        for (size_t a : target_axes) {
+            static_assert(a < Rank, "[ERR_BOUNDS] Un asse di riduzione supera il rango del tensore.");
+        }
+
+        constexpr size_t OutRank = Rank - sizeof...(ReduceAxes);
+        std::array<size_t, OutRank> out_shape{};
+        size_t ptr = 0;
+
+        for (size_t i = 0; i < Rank; ++i) {
+            if (!is_axis_in_set(i, target_axes)) {
+                out_shape[ptr++] = Shape[i];
+            }
+        }
+        return out_shape;
+    }
+
+    // 2. Calcola la forma TRATTENENDO solo un insieme di assi fissati (Utilizzato per l'Aggregazione Relazionale)
+    template <size_t... RetainedAxes>
+    static constexpr auto compute_retained_shape() {
+        std::vector<size_t> retained_set = { RetainedAxes... };
+        for (size_t a : retained_set) {
+            static_assert(a < Rank, "[ERR_BOUNDS] Un asse trattenuto supera il rango del tensore.");
+        }
+
+        constexpr size_t OutRank = sizeof...(RetainedAxes);
+        std::array<size_t, OutRank> out_shape{};
+        for (size_t i = 0; i < OutRank; ++i) {
+            out_shape[i] = Shape[retained_set[i]];
+        }
+        return out_shape;
+    }
+
 };
 
 #endif //TENSORLIBRARY_METATENSOR_H
