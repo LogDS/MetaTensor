@@ -39,7 +39,7 @@ dependencies = [
 # Forza scikit-build-core ad applicare una build di Release ottimizzata di default
 cmake.build-type = "Release"
 # Indica a CMake dove posizionare i file di configurazione dei moduli Python esportati
-wheel.packages = ["src/py/metatensor_py"]
-cmake.args = ["-DCMAKE_CXX_STANDARD=26"] # oppure 20 se usi C++20
+wheel.packages = ["src/py/metatensor_py/", "metatensor_core"]
+cmake.args = ["-DCMAKE_CXX_STANDARD=20"] # oppure 20 se usi C++20
 cmake.version = ">=3.26"
 ninja.version = ">=1.11"

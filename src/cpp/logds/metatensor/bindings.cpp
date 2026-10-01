@@ -1,5 +1,5 @@
 /*
-* This file is part of the MetaTensor distribution (https://github.com/logds/MetaTensor).
+ * This file is part of the MetaTensor distribution (https://github.com).
  * Copyright (c) 2026 Giacomo Bergami, PhD
  *
  * This program is free software: you can redistribute it and/or modify
@@ -12,7 +12,7 @@
  * General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ * along with this program. If not, see <http://gnu.org>.
  */
 
 #include <nanobind/nanobind.h>
@@ -23,8 +23,15 @@
 #include <logds/metatensor/Init.h>
 #include <string>
 #include <sstream>
+#include <array>
+#include <tuple>
 
 namespace nb = nanobind;
+
+// Helper strutturali per definire le liste di dimensioni fisse a compile-time
+template <size_t... Is> struct ShapePack {
+    static constexpr std::array<size_t, sizeof...(Is)> data = { Is... };
+};
 
 // 1. Generatore Constexpr del nome della classe Python (es: "MetaTensor_float_128_64")
 template <typename T, size_t... Dims>
@@ -43,50 +50,57 @@ void bind_tensor_instance(nb::module_ &m) {
     std::string name = get_tensor_classname<T, Dims...>();
     using TensorType = MetaTensor<T, Dims...>;
 
-    nb::class_<TensorType>(m, name.c_str())
+    auto cl = nb::class_<TensorType>(m, name.c_str())
         // Costruttore standard che accetta il tag InitPattern e il dispositivo
-        .def(nb::init<InitPattern, torch::Device>(), nb::arg("pattern"), nb::arg("device") = torch::kCPU)
-        // Costruttore di default (RandomNormal)
-        .def(nb::init<torch::Device>(), nb::arg("device") = torch::kCPU)
-
-        .def_readonly_static("rank", &TensorType::Rank)
-        .def_property_readonly("shape", [](const TensorType&) {
+        .def(nb::init<torch::Device, InitPattern>(),  nb::arg("device") = torch::kCPU, nb::arg("pattern") = InitPattern::RandomNormal)
+        .def_ro_static("rank", &TensorType::Rank)
+        .def_prop_ro("shape", [](const TensorType&) {
             std::vector<size_t> s(TensorType::Shape.begin(), TensorType::Shape.end());
             return s;
         })
-
         .def("watch", &TensorType::watch)
         .def("clear", &TensorType::clear)
         .def("element_wise_sigmoid", &TensorType::element_wise_sigmoid)
         .def("reduce_all_sum", &TensorType::reduce_all_sum)
         .def("pretty_print_sparse", &TensorType::pretty_print_sparse, nb::arg("threshold") = 1e-4f)
 
-        // Estrattore scalare nativo per Python via cast implicito C++26
-        .def("__float__", [](const TensorType& t) { return static_cast<float>(t); })
 
         // Interfaccia esplicita per l'applicazione dei gradienti
         .def("apply_gradient_descent", [](TensorType& t, const TensorType& grad, float lr) {
             t.apply_gradient_descent(grad, lr);
         });
+
+    // RISOLUTIVO: Il compilatore inietta __float__ in Python SOLO se la variante
+    // ha Rank == 0 o se tutte le sue dimensioni statiche collassano a 1.
+    if constexpr (TensorType::Rank == 0 || (... && (Dims == 1))) {
+        cl.def("__float__", [](const TensorType& t) {
+            // Invocazione sicura del cast implicito convalidato a compile-time
+            return static_cast<float>(t);
+        });
+    }
 }
 
-// 3. Meta-Binder Loop per srotolare coppie e combinazioni di dimensioni esplicite
+// 3. Helper di scompattamento: estrae in modo pulito il pack "Is..." da ShapePack
+template <typename T, typename SingleShape>
+struct SingleShapeBinder;
+
+template <typename T, size_t... Is>
+struct SingleShapeBinder<T, ShapePack<Is...>> {
+    static void execute(nb::module_ &m) {
+        bind_tensor_instance<T, Is...>(m);
+    }
+};
+
+// 4. Meta-Binder Loop per srotolare la tupla di ShapePack
 template <typename T, typename ShapesTuple>
 struct MetaTensorBinder;
 
 template <typename T, typename... SubShapes>
 struct MetaTensorBinder<T, std::tuple<SubShapes...>> {
     static void bind(nb::module_ &m) {
-        // Srotola le definizioni della tupla invocando il binding istanziato
-        ([&]() {
-            bind_tensor_instance<T, SubShapes::data...>(m);
-        }(), ...);
+        // Il fold expression ora agisce sulla classe helper, dove "SubShapes" è un pack di tipi valido
+        (SingleShapeBinder<T, SubShapes>::execute(m), ...);
     }
-};
-
-// Helper strutturali per definire le liste di dimensioni fisse a compile-time
-template <size_t... Is> struct ShapePack {
-    static constexpr std::array<size_t, sizeof...(Is)> data = { Is... };
 };
 
 // =============================================================================
@@ -114,4 +128,3 @@ NB_MODULE(metatensor_core, m) {
     // Compiliamo ed iniettiamo le classi nel modulo binario
     MetaTensorBinder<float, TargetShapes>::bind(m);
 }
-
