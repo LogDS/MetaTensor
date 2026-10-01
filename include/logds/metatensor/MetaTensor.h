@@ -19,6 +19,7 @@
 #define TENSORLIBRARY_METATENSOR_H
 
 #include <logds/metatensor/TensorCellProxy.h>
+#include <logds/metatensor/CellOp.h>
 #include <logds/metatensor/Init.h>
 #include <torch/torch.h>
 #include <array>
@@ -686,6 +687,9 @@ public:
         else if constexpr (Op == CellOp::Exp) {
             result_storage = torch::exp(this->storage);
         }
+        else if constexpr (Op == CellOp::Exp2) {
+            result_storage = torch::exp2(this->storage);
+        }
         else if constexpr (Op == CellOp::Log) {
             result_storage = torch::log(this->storage);
         }
@@ -703,9 +707,14 @@ public:
         }
 
         // Mantiene intatto il layout di memoria originale (Dense o Sparse) e le dimensioni statiche
-        return MetaTensor<T, Layout, Dims...>(result_storage);
+        return MetaTensor<T, Dims...>(result_storage);
     }
 
+    // Helper per verificare se un indice fa parte degli assi da ridurre
+    template <std::size_t... ReduceAxes>
+    static constexpr bool is_reduced(std::size_t Index) {
+        return ((Index == ReduceAxes) || ...);
+    }
 
 public:
     // =============================================================================
@@ -822,33 +831,32 @@ private:
     }
 
     // 1. Calcola la forma eliminando un insieme di assi (Utilizzato per l'Esistenziale e Riduzioni standard)
-    template <size_t... ReduceAxes>
-    static constexpr auto compute_eliminated_shape() {
-        std::vector<size_t> target_axes = { ReduceAxes... };
-        // Validazione preventiva bloccante
-        for (size_t a : target_axes) {
-            static_assert(a < Rank, "[ERR_BOUNDS] Un asse di riduzione supera il rango del tensore.");
-        }
+    template <std::size_t... ReduceAxes>
+        static constexpr auto compute_eliminated_shape() {
+        // 1. Convertiamo il pacchetto Dims originario in un array per lavorarci a tempo di compilazione
+        constexpr std::array<std::size_t, sizeof...(Dims)> input_dims = { Dims... };
 
-        constexpr size_t OutRank = Rank - sizeof...(ReduceAxes);
-        std::array<size_t, OutRank> out_shape{};
-        size_t ptr = 0;
+        // 2. Calcoliamo la dimensione del nuovo array (quanti assi NON vengono ridotti)
+        // Nota: se la riduzione mantiene la dimensione rimossa, la logica cambia (es. mantiene la shape ma a 1)
+        // Questa logica ELIMINA completamente gli assi ridotti:
+        constexpr std::size_t out_size = sizeof...(Dims) - sizeof...(ReduceAxes);
+        std::array<std::size_t, out_size> output_dims{};
 
-        for (size_t i = 0; i < Rank; ++i) {
-            if (!is_axis_in_set(i, target_axes)) {
-                out_shape[ptr++] = Shape[i];
+        std::size_t out_idx = 0;
+        for (std::size_t i = 0; i < input_dims.size(); ++i) {
+            if (!is_reduced<ReduceAxes...>(i)) {
+                output_dims[out_idx++] = input_dims[i];
             }
         }
-        return out_shape;
+
+        return output_dims; // Restituisce un std::array, perfettamente legale in constexpr!
     }
 
     // 2. Calcola la forma TRATTENENDO solo un insieme di assi fissati (Utilizzato per l'Aggregazione Relazionale)
     template <size_t... RetainedAxes>
     static constexpr auto compute_retained_shape() {
         std::vector<size_t> retained_set = { RetainedAxes... };
-        for (size_t a : retained_set) {
-            static_assert(a < Rank, "[ERR_BOUNDS] Un asse trattenuto supera il rango del tensore.");
-        }
+        static_assert(((RetainedAxes < Rank) && ...), "[ERR_BOUNDS] Un asse trattenuto supera il rango del tensore.");
 
         constexpr size_t OutRank = sizeof...(RetainedAxes);
         std::array<size_t, OutRank> out_shape{};

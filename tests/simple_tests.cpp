@@ -259,12 +259,12 @@ TEST_CASE("Runtime: Cell Extraction Multidimensionale via std::array", "[operato
 #include <logds/metatensor/Init.h>
 #include <iostream>
 
-int main() {
+TEST_CASE("Validazione Operatori Generalizzati", "[ex+agg]")  {
     auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
     std::cout << "=== Validazione Operatori Generalizzati C++26 ===\n\n";
 
     // Un tensore 4D di partenza: [Batch=16, Rows=32, Cols=64, Channels=3]
-    MetaTensor<float, 16, 32, 64, 3> Z(InitPattern::RandomNormal, device);
+    MetaTensor<float, 16, 32, 64, 3> Z( device, InitPattern::RandomNormal);
 
     // =========================================================================
     // TEST 1: Quantificatore Esistenziale Multi-Asse Generalizzato (∃)
@@ -272,7 +272,7 @@ int main() {
     // Riduciamo ed eliminiamo contemporaneamente l'asse 1 (32) e l'asse 2 (64)
     // applicando un predicato cellulare condizionale arbitrario via Lambda.
     // Tipo atteso dedotto dal compilatore: MetaTensor<float, 16, 3> (Rank = 2)
-    auto exists_graph = Z.template evaluate_existential<1, 2>([](const torch::Tensor& cell) {
+    auto exists_graph = Z.evaluate_existential<1, 2>([](const torch::Tensor& cell) {
         return (cell > 1.5f) | (cell < -1.5f); // Maschera logica cellulare OR
     });
 
@@ -289,7 +289,7 @@ int main() {
     // Questo significa che l'asse 1 (32) e l'asse 3 (3) costituiscono il complemento 
     // e verranno contratti effettuando una riduzione moltiplicativa (PRODUCT).
     // Tipo atteso dedotto dal compilatore: MetaTensor<float, 16, 64> (Rank = 2)
-    auto aggregated_graph = Z.template aggregate<0, 2>(MetaTensor<float, 16, 32, 64, 3>::AggregationOp::PRODUCT);
+    auto aggregated_graph = Z.aggregate<0, 2>(MetaTensor<float, 16, 32, 64, 3>::AggregationOp::PRODUCT);
 
     STATIC_REQUIRE(decltype(aggregated_graph)::Rank == 2);
     STATIC_REQUIRE(decltype(aggregated_graph)::Shape[0] == 16);
@@ -302,7 +302,6 @@ int main() {
     exists_graph.clear();
     aggregated_graph.clear();
 
-    return 0;
 }
 
 #include <torch/torch.h>
@@ -311,12 +310,12 @@ int main() {
 #include <logds/metatensor/CellOp.h>
 #include <iostream>
 
-int main() {
+TEST_CASE("Validazione Operatori Unari", "[unop]")  {
     auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
     std::cout << "=== Verifica Operatore Unario Unificato MetaTensor ===\n\n";
 
-    MetaTensor<float, StorageLayout::Dense, 128, 64> X(InitPattern::RandomUniform, device);
-    MetaTensor<float, StorageLayout::Dense, 64, 1>   W(InitPattern::Zeros, device);
+    MetaTensor<float, 128, 64> X(device, InitPattern::RandomUniform);
+    MetaTensor<float, 64, 1>   W( device, InitPattern::Zeros);
 
     // 1. FORWARD PASS PULITO ED UNIFICATO
     // Invece di chiamare metodi hardcoded, indichiamo l'operazione tramite l'enum
@@ -337,7 +336,5 @@ int main() {
     W.clear();
     Y_pred.clear();
     Y_pred_tanh.clear();
-
-    return 0;
 }
 
