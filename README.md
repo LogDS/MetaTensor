@@ -6,16 +6,18 @@
 
 **MetaTensor** is a strongly-typed, compile-time verified algebraic-relational tensor engine written in **C++26** and built on top of the bare-metal infrastructures of **OpenXLA (StableHLO)** and **LibTorch (ATen Core)**.
 
-The framework shifts tensor geometric validation (rank verification, axis alignment, and dimensions matching) entirely from runtime execution to **compile-time** via Non-Type Template Parameters (NTTP) and C++20/26 Constraints (`requires`). This allows the underlying compiler to aggressively fuse computational graphs and execute a surgical hardware memory reclamation protocol (**Zero-Caching**) to prevent any deferred allocations or memory leaks inside GPU cluster nodes.
+The framework shifts tensor geometric validation (rank verification, axis alignment, and dimensions matching) and physical layout semantics entirely from runtime tracking to **compile-time** via Non-Type Template Parameters (NTTP) and C++20/26 Constraints (`requires`). This enables aggressive graph-kernel fusion inside the OpenXLA/StableHLO backend while enforcing a surgical, deterministic hardware memory reclamation protocol (**Zero-Caching**) to prevent deferred allocations or memory leaks inside GPU cluster nodes.
 
 ---
 
 ## 🚀 Key Features
 
-*   **Compile-Time Structural Verification:** Rank and axis bounds are permanently bound to the class type signatures (`MetaTensor<T, Dims...>`). Any geometric mismatch or illegal broadcasting triggers a blocking compiler error (`static_assert`) instead of a catastrophic runtime segmentation fault or exception.
-*   **Relational Axis Projections:** Multi-dimensional contractions and *Einstein Sums* (`einsum`) completely bypass slow runtime string parsing. Instead, they are declared using pure relational coordinate projections (`L<0>, R<1>`). The C++ compiler deduces the contracting axis and generates the optimal HLO string representation behind the scenes at zero runtime cost.
-*   **Deterministic RAII Memory Recovery:** The destructor of the tensor wrapper bypasses PyTorch's lazy caching allocator pool by directly invoking `c10::cuda::CUDACachingAllocator::emptyCache()`. The moment an intermediate temporary tensor exits its local block scope `{}`, its VRAM allocation is physically unmapped at the hardware driver level.
-*   **C++26 Implicit Scalar Casts:** Tensors that collapse to unit dimensions (such as a 0-D global loss scalar) support a type-safe implicit conversion operator to native C++ primitive types (`float`, `double`), completely removing the need for boilerplate `.item()` extraction methods at runtime.
+*   **Compile-Time Structural Verification:** Rank, axis bounds, and physical layout parameters are permanently bound to the class type signatures (`MetaTensor<T, Layout, Dims...>`). Any geometric mismatch, illegal broadcasting, or unmappable sparse-dense intersection triggers a blocking compiler error (`static_assert`) instead of a runtime crash.
+*   **Monomorphized Storage Layouts:** Native support for both dense matrices and high-dimensional coordinate sparse tensors (`StorageLayout::SparseCOO`). The engine utilizes compile-time branching (`if constexpr`) to automatically choose between ultra-fast dense BLAS operations, native sparse operations (`torch::mm`), or transient on-the-fly auto-densifications.
+*   **Context-Driven Active Epoches:** Replaces passive autograd loops with declarative, RAII-enforced active epoch contexts (`tape.next_epoch()`). Optimization steps, backpropagation, and hardware cache evacuations are fully automated and synchronized at the closing brace of conditional block scopes (`if`).
+*   **Advanced Parameter Optimization:** Integrated variadic optimization states supporting **SGD with Momentum** and **Adam** alongside configurable **Learning Rate Decay Schemes** (Step and Exponential Decay) tracked directly inside the session tape.
+*   **Functional Generalized Operators:** Multi-axis existential quantification ($\exists$) governed by arbitrary lambda predicates and relational aggregations (such as associative MapReduce contraction steps) resolved entirely at compile-time.
+*   **Dual Local/Distributed Parallelism:** Fully integrated data parallelism that dynamically detects whether it is running via an MPI process manager (`mpirun`/`mpiexec`) or on a standalone workstation, providing a zero-overhead fallback to local hardware.
 
 ---
 
@@ -23,169 +25,188 @@ The framework shifts tensor geometric validation (rank verification, axis alignm
 
 The engine is engineered as a zero-overhead, modular abstraction layer:
 
-### 1. Pattern-Driven Initialization (`Init.h`)
-Differentiates VRAM vector allocation routines using static structural flags, validating geometric restrictions (e.g., identity matrices) at compile-time.
+### 1. Storage Layouts & Pattern-Driven Inits (`Init.h` & `StorageLayout.h`)
 ```cpp
+enum class StorageLayout { Dense, SparseCOO };
+
 enum class InitPattern {
     RandomNormal,   // Gaussian normal distribution sampling
     RandomUniform,  // Uniform distribution sampling over [0, 1)
     Zeros,          // Fills structure with 0.0f (e.g., Bias Tensors)
     OnOnes,         // Fills structure with 1.0f (e.g., Constant Targets)
-    Identity        // Identity Matrix (tf.eye - Enforces static_assert M == N)
+    Identity        // Identity Matrix (Requires rank == 2 and square dimensions)
 };
 ```
 
 ### 2. Core Tensor Wrapper Definition (`MetaTensor.h`)
 ```cpp
-template <typename T, size_t... Dims>
+template <typename T, StorageLayout Layout, size_t... Dims>
 class MetaTensor {
 public:
     static constexpr size_t Rank = sizeof...(Dims);
     static constexpr std::array<size_t, Rank> Shape = { Dims... };
+    static constexpr StorageLayout layout = Layout;
+    using value_type = T;
+
     torch::Tensor storage;
 
-    // Bare-Metal Constructors & RAII Cleanups
-    MetaTensor(torch::Device device = torch::kCPU, InitPattern pattern);
+    // Bare-Metal and Structured Constructors
+    MetaTensor(torch::Device device = torch::kCPU, InitPattern pattern = InitPattern::RandomNormal);
+    template <typename TupleT>
+    MetaTensor(const std::vector<TupleT>& entries, const std::vector<T>& values, torch::Device device = torch::kCPU);
     MetaTensor(torch::Tensor t);
+    
+    static auto from_scalar(T value, torch::Device device = torch::kCPU);
+    auto to_dense() const;
     void clear();
     ~MetaTensor();
 
-    // Relational Tensor Algebra Framework (The 12 Mathematized Operations)
+    // Relational Tensor Algebra & Multi-Axis Existential Quantification (∃)
+    template <CellOp Op> auto apply() const;
     auto element_wise_sigmoid() const;
     template <size_t... Perm> auto permute_axes() const;
     template <size_t Axis> auto reduce_sum() const;
-    auto reduce_all_sum() const; // Collapses structure to a pure 0-D scalar
-    template <size_t NumSegments, typename IdTensorT> auto segment_sum(const IdTensorT& segment_ids) const;
-    template <size_t Depth> auto one_hot_encoding() const;
-    template <typename IndexTensorT> auto gather_nd(const IndexTensorT& indices) const;
+    auto reduce_all_sum() const; 
     
-    // Sections 11 & 12: Relational Theta-Joins and Existential Quantification (∃)
-    template <typename RightT> auto tensor_theta_join(const RightT& other) const;
-    template <size_t ReduceAxis> auto evaluate_existential_expression() const;
+    template <size_t... ReduceAxes, typename PredicateLambda>
+    auto evaluate_existential(PredicateLambda&& predicate) const;
+    template <size_t... RetainedAxes> 
+    auto aggregate(AggregationOp op) const;
 
-    // Standard C++ Operator Overloading Overriding
-    template <size_t... RightDims> auto operator+(const MetaTensor<T, RightDims...>& other) const; // Auto-Broadcasting
-    template <size_t... RightDims> auto operator-(const MetaTensor<T, RightDims...>& other) const;
-    template <size_t... RightDims> auto operator*(const MetaTensor<T, RightDims...>& other) const; // Universal MatMul via contraction
-    template <size_t... RightDims> auto operator%(const MetaTensor<T, RightDims...>& other) const; // Native 3D Cross Product
+    // Type-Safe Multi-Dimensional Cell Extraction (Enforces N == Rank to prevent illegal slicing)
+    template <size_t N> requires (N == Rank)
+    TensorCellProxy operator[](const std::array<size_t, N>& coords);
 
-    // Conditional Masking and Sparse Diagnostics
-    template <typename ConditionLambda> auto where(ConditionLambda&& condition, float on=1.f, float off=0.f) const;
-    auto clip(float min_val = 0.0f, float max_val = 1.0f) const;
-    void pretty_print_sparse(float threshold = 1e-4f) const;
-    
-    // Hardware Execution Offloading
-    auto to_device(torch::Device target_device = torch::kCUDA) const;
-    auto to_host() const;
+    // Polymorphic Operator Overloading (Auto-Layout Dispatching)
+    template <StorageLayout RLayout, size_t... RDims> auto operator+(const MetaTensor<T, RLayout, RDims...>& other) const;
+    template <StorageLayout RLayout, size_t... RDims> auto operator*(const MetaTensor<T, RLayout, RDims...>& other) const;
+    template <StorageLayout RLayout, size_t... RDims> auto operator%(const MetaTensor<T, RLayout, RDims...>& other) const; // 3D Cross Product
 
-    // C++26 SFINAE / Requires Constraints for Safe Scalar Primitive Casting
+    // Dual-Execution Data Parallel Distributed Operations
+    template <size_t PartitionAxis = 0> auto distributed_scatter() const;
+    auto distributed_allreduce_sum() const;
+
+    // C++26 Safe Scalar Primitive Casting (Enabled only if Rank == 0 or dimensions collapse to 1)
     template <typename U = T> requires (Rank == 0 || (... && (Dims == 1))) operator U() const;
 };
 ```
 
-### 3. Multi-Tensor GradientTape Context (`GradientTape.h`)
-Encapsulates LibTorch's Autograd mechanism by binding parameter tracking boundaries (`watch` / `unwatch`) directly to the RAII lifespan of the tape, eliminating memory leaks in the computation graph.
+### 3. Active Optimization Gradient Tape (`GradientTape.h`)
 ```cpp
-struct GradientTape {
-    // Spawns recording context and triggers explicit parameter watching
-    template <typename... TensorTypes> GradientTape(TensorTypes&... tensors);
-    
-    // Destructor: Automatically revokes parameter flags when tape goes out of scope
-    ~GradientTape();
+enum class OptimizerType { SGD, Momentum, Adam };
+enum class DecayType { None, Step, Exponential };
 
-    // Executes a single global backward pass and packs Jacobian matrices into a typed static tuple
-    template <typename LossT, typename... TensorTypes>
-    auto gradients(LossT& loss_tensor, const TensorTypes&... tensors);
+struct GradientTape {
+    OptimizerState optimizer_state;
+
+    template <typename... TensorTypes> GradientTape(TensorTypes&... tensors);
+    void set_optimizer(OptimizerType type);
+    void set_lr_decay(DecayType scheme, float gamma, int64_t steps = 10);
+
+    // Active Epoch Context Generator (Binds parameter references and eliminates manual loops)
+    template <typename... TensorTypes>
+    auto next_epoch(float lr, bool& early_stop, TensorTypes&... tensors);
 };
 ```
 
 ---
 
-## 🛠️ Production-Grade Training Example: Convergent Loop
+## 🛠️ Hybrid Dual-Execution Training Example
 
-This script demonstrates a real optimization step executed on a CUDA GPU accelerator. Dataset blocks persist globally, while all temporary execution parameters are entirely wiped out of the physical VRAM at the end of each epoch using the isolated block scope `{}`.
+This script demonstrates a real optimization step under an active **Adam** optimizer with **Exponential Learning Rate Decay**. If executed normally (`./main`), it runs as a local single-machine process over the full dataset. If spawned via `mpirun -n 4 ./main`, it automatically shards the data over 4 nodes, processes partial batch steps, and synchronizes network weights over GLOO/NCCL ring topologies.
 
 ```cpp
+#include <indicators/progress_bar.hpp>
+#include <indicators/cursor_control.hpp>
 #include <torch/torch.h>
 #include <logds/metatensor/MetaTensor.h>
 #include <logds/metatensor/GradientTape.h>
+#include <logds/metatensor/DistributedContext.h>
 #include <logds/metatensor/Init.h>
 #include <iostream>
+#include <iomanip>
 
 int main() {
-    // Automated hardware backend dispatching
+    // 1. DYNAMIC DISTRIBUTED CLUSTER CONFIGURATION
+    DistributedContext::init();
+    bool show_ui = DistributedContext::is_root();
+    if (show_ui) indicators::show_console_cursor(false);
+
+    float learning_rate = 0.05f; 
+    constexpr int max_epochs = 250;
+    constexpr float convergence_threshold = 1e-3f;
     auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
-    std::cout << "=== Launching Optimization on Hardware Nodes ===\n";
 
-    float learning_rate = 0.5f; 
-    int max_epochs = 10;
+    // 2. COORDINATED DATASET INITIALIZATION
+    DMetaTensor<float, 128, 64> X_global(device, InitPattern::Zeros);
+    DMetaTensor<float, 64, 1>   W_true(device, InitPattern::Zeros);
 
-    // 1. PERSISTENT DATASET: Allocated once outside the loop boundaries
-    MetaTensor<float, 128, 64> X(InitPattern::RandomUniform, device);
-    MetaTensor<float, 64, 1>   W_true(InitPattern::RandomNormal, device);
-    
-    // Create stable targets using a Teacher-Student Pattern to guarantee analytical convergence
-    auto Y_true = (X * W_true).element_wise_sigmoid();
+    if (DistributedContext::is_root()) {
+        X_global.storage = torch::rand({128, 64}, torch::TensorOptions().device(device));
+        W_true.storage = torch::randn({64, 1}, torch::TensorOptions().device(device));
+    }
 
-    // 2. MODEL PARAMETERS TO BE OPTIMIZED (Initialized to Zero)
-    MetaTensor<float, 64, 1> W(InitPattern::Zeros, device);
+    // Broadcast structures across the network topology via functional reduction
+    auto X_sync = X_global.distributed_allreduce_sum();
+    auto W_true_sync = W_true.distributed_allreduce_sum();
+    auto Y_true_global = (X_sync * W_true_sync).element_wise_sigmoid();
 
-    // 3. GRADIENT TAPE INITIALIZATION BEFORE THE TRAINING LOOP
-    // Explicitly binds parameter tracking to the tape's RAII lifecycle context
+    // 3. DATA PARALLEL SCATTERING WITH AUTOMATIC LOCAL FALLBACK
+    auto X_local = X_sync.template distributed_scatter<0>();
+    auto Y_true_local = Y_true_global.template distributed_scatter<0>();
+
+    // MODEL PARAMETERS (Synchronized across all cluster workers)
+    DMetaTensor<float, 64, 1> W(device, InitPattern::Zeros);
+
+    // 4. OPTIMIZER CONFIGURATION ON THE GRADIENT TAPE
     GradientTape tape(W);
+    tape.set_optimizer(OptimizerType::Adam);
+    tape.set_lr_decay(DecayType::Exponential, 0.95f); 
+    bool early_stopping_triggered = false;
 
     for (int epoch = 1; epoch <= max_epochs; ++epoch) {
         float host_loss_value = 0.0f;
 
         // =====================================================================
-        // ISOLATED LOCAL SCOPE FOR TEMPORARY INTERMEDIATE VRAM BUFFERS
+        // ACTIVE CONTEXT SCOPE BLOCK
         // =====================================================================
-        {
-            // Fused Forward Pass: Overridden '*' operator automatically invokes relational contraction
-            auto Y_pred = (X * W).element_wise_sigmoid();
-            
-            // Algebraic element-wise operations with compile-time broadcast checks
-            auto error = Y_pred - Y_true;
-            auto square_error = error.element_wise_mul(error);
-            
-            // Total multi-axis reduction to a pure 0-D scalar (Rank = 0)
-            auto loss = square_error.reduce_all_sum();
+        if (auto epoch_context = tape.next_epoch(learning_rate, early_stopping_triggered, W)) {
 
-            // Direct numerical extraction utilizing the C++26 implicit cast operator
+            // Process forward steps over sharded matrices (32 rows if distributed, 128 if local)
+            auto Y_pred_local = (X_local * W).element_wise_sigmoid();
+            auto error_local = Y_pred_local - Y_true_local;
+            auto loss = error_local.element_wise_mul(error_local).reduce_all_sum();
+
             host_loss_value = loss;
-
-            // Retropropagate gradients back through the HLO graph into a packed static tuple
-            auto [dW] = tape.gradients(loss, W);
-
-            // In-place weights mutation isolated from Autograd tracking mechanics
-            W.apply_gradient_descent(dW, learning_rate);
+            // Safe shallow copy ingestion protects the autograd graph against Zero-Caching deallocations
+            epoch_context.feed_loss(loss);
             
-        } // <--- LOCAL SCOPE EXITS HERE!
-          // All temporary tensors (Y_pred, error, square_error, loss, dW) go out of scope.
-          // The ~MetaTensor() destructor executes an immediate hardware cache evacuation.
-          // Intermediate VRAM footprint is 100% reset before the next iteration begins.
-
-        std::cout << "Epoch " << epoch << " -> Global MSE Loss: " << host_loss_value << "\n";
+        } // <--- ACTIVE SCOPE CLOSES DETERMINISTICALLY HERE!
+        // Automatically performs loss.backward() -> collective network AllReduce SUM ->
+        // computes Adam rolling historical moments -> updates W parameters -> purges VRAM.
+    else {
+        break;
     }
-
-    // 4. MANUAL CLEANUP OF GLOBAL PERSISTENT STRUCTURES
-    W.clear();
-    X.clear();
-    Y_true.clear();
-    W_true.clear();
-
+    if (show_ui) {
+            std::cout << "Epoch " << epoch << "/" << max_epochs << " | Synchronized Loss: " << host_loss_value << "\n";
+    }
+            if (host_loss_value < convergence_threshold) break;
+    }
+    if (show_ui) indicators::show_console_cursor(true);
+    // Hard unmapping of physical device allocations
+    W.clear(); X_global.clear(); Y_true_global.clear(); W_true.clear(); X_local.clear(); Y_true_local.clear();
     return 0;
 }
 ```
 
----
-
 ## 💻 System Requirements & Compilation
 
-### Prerequisites
-*   **Compiler:** A C++ compiler fully compliant with the **C++26** standard (GCC 14+, Clang 18+).
-* **Dependencies**: LibTorch Toolkit (PyTorch C++ Library) extracted and available on the host machine.
+Prerequisites
 
+* **Compiler**: A C++ compiler fully compliant with the C++26 standard (GCC 14+, Clang 18+; GCC 12 is supported with -std=gnu++20).
+* **Libraries**: LibTorch Toolkit (PyTorch C++ Shared Library) extracted and available on the host path.
+* **Distributed Env (Optional)**: OpenMPI or MPICH system runtimes installed on the node cluster.
+* 
 ## 📜 License
 This project is licensed under the terms of the GNU General Public License v3 (GPLv3). See the LICENSE file for detailed provisions.
 
