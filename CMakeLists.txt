@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.26) # scikit-build-core richiede almeno 3.15+, 3.26 garantisce la stabilità per nanobind e CUDA 13
 
+# Opzione per attivare o disattivare il supporto distribuito (Disattivata di default)
+option(METATENSOR_USE_MPI "Build MetaTensor with multi-node MPI cluster support" OFF)
+
+if(METATENSOR_USE_MPI)
+    # Se attivata dall'utente, iniettiamo la macro di compilazione globale
+    add_compile_definitions(METATENSOR_USE_MPI)
+    message(STATUS "[MetaTensor] Multi-node Distributed Parallelism ENABLED")
+else()
+    message(STATUS "[MetaTensor] Running in Single-Machine Local mode (Distributed disabled)")
+endif()
+
 # 1. Uniforma i percorsi di ricerca di CMake per CUDA 13.2 prima di trovare i pacchetti
 set(CMAKE_CUDA_COMPILER "/usr/local/cuda-13.2/bin/nvcc")
 set(CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda-13.2")
@@ -76,6 +87,10 @@ apply_maximum_cxx_standard(memory_transfer)
 add_executable(gradient_descent examples/gradient_descent.cpp)
 target_link_libraries(gradient_descent "${TORCH_LIBRARIES}")
 apply_maximum_cxx_standard(gradient_descent)
+
+add_executable(distributed_gradient_descent examples/distributed_gradient_descent.cpp)
+target_link_libraries(distributed_gradient_descent "${TORCH_LIBRARIES}")
+apply_maximum_cxx_standard(distributed_gradient_descent)
 
 ## --- Modulo Nanobind ---
 #nanobind_add_module(metatensor_core NOMINSIZE src/cpp/logds/metatensor/bindings.cpp)

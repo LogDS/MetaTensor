@@ -33,8 +33,8 @@ int main() {
     std::cout << "=== Orchestrazione Avanzata con Ottimizzatore Adam (C++26) ===\n\n";
 
     // Nota: Adam richiede un tasso di apprendimento più basso rispetto a SGD puro
-    float learning_rate = 0.001f;
-    constexpr int max_epochs = 50;
+    float learning_rate = 0.05f;       // Incrementato per accelerare i passi di Adam
+    constexpr int max_epochs = 250;    // Aumentato per dare il tempo al grafo di convergere
     constexpr float convergence_threshold = 1e-3f;
 
     DMetaTensor<float, 128, 64> X(device, InitPattern::RandomUniform);
@@ -69,6 +69,7 @@ int main() {
         if (auto epoch_context = tape.next_epoch(learning_rate, early_stopping_triggered)) {
             auto Y_pred = (X * W).element_wise_sigmoid();
             auto loss = (Y_pred - Y_true).element_wise_mul(Y_pred - Y_true).reduce_all_sum();
+            host_loss_value = loss;
             epoch_context.feed_loss(loss);
             std::stringstream ss;
             ss << "Epoch " << epoch << "/" << max_epochs << " | Loss: " << std::fixed << std::setprecision(6) << host_loss_value;

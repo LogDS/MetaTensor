@@ -14,10 +14,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
-/*
- * This file is part of the MetaTensor distribution (https://github.com).
- * Copyright (c) 2026 Giacomo Bergami, PhD
- */
+
 
 #ifndef TENSORLIBRARY_GRADIENTTAPE_H
 #define TENSORLIBRARY_GRADIENTTAPE_H
@@ -28,6 +25,7 @@
 #include <utility>
 #include <cmath>
 #include <functional>
+#include <logds/metatensor/DistributedContext.h>
 
 // Forward Declaration del Nastro fortemente tipizzato
 template <typename... TensorTypes> struct GradientTape;
@@ -116,31 +114,40 @@ struct GradientTape {
     // Aggiornamento centralizzato: non è più una funzione template indipendente!
         // All'interno di struct GradientTape in GradientTape.h
     // All'interno di struct GradientTape in GradientTape.h
-    void apply_optimization_step(float base_lr) {
+        // =============================================================================
+    // MOTORE DI OTTIMIZZAZIONE AVANZATO CENTRALIZZATO (C++26 Variadic Framework)
+    // =============================================================================
+    // Esegue il calcolo e la sincronizzazione multinodo dei gradienti, applica
+    // le equazioni dei momenti hardware e pulisce deterministicamente la VRAM.
+    void apply_optimization_step(float base_lr, std::tuple<TensorTypes*...> watched_tensors) {
         optimizer_state.step++;
+
+        // 1. CALCOLO DINAMICO DEL LEARNING RATE DECAY
         float current_lr = base_lr;
         if (optimizer_state.decay_scheme == DecayType::Exponential) {
             current_lr = base_lr * std::pow(optimizer_state.lr_gamma, static_cast<float>(optimizer_state.step));
-        } else if (optimizer_state.decay_scheme == DecayType::Step) {
+        }
+        else if (optimizer_state.decay_scheme == DecayType::Step) {
             int64_t intervals = optimizer_state.step / optimizer_state.decay_steps;
             current_lr = base_lr * std::pow(optimizer_state.lr_gamma, static_cast<float>(intervals));
         }
 
+        // 2. INIZIALIZZAZIONE LAZY DEI BUFFER DEI MOMENTI STORICI IN VRAM
         size_t num_tensors = sizeof...(TensorTypes);
         if (optimizer_state.exp_avg.empty()) {
             optimizer_state.exp_avg.resize(num_tensors);
             if (optimizer_state.type == OptimizerType::Adam) {
                 optimizer_state.exp_avg_sq.resize(num_tensors);
             }
+
             size_t idx = 0;
             std::apply([&](auto*... tensor_ptrs) {
                 (([&]() {
                     if (tensor_ptrs) {
-                        // RISOLUTIVO: Estraiamo il tipo statico del layout per evitare errori di compilazione dipendenti
                         using CurrentTensorT = std::remove_pointer_t<decltype(tensor_ptrs)>;
-                        constexpr auto current_layout = CurrentTensorT::layout;
 
-                        if (current_layout == CurrentTensorT::layout_type_sparse && optimizer_state.type == OptimizerType::Adam) {
+                        // Se il tensore è sparso e usiamo Adam, forziamo i momenti a essere allocati come densi
+                        if (CurrentTensorT::layout == StorageLayout::SparseCOO && optimizer_state.type == OptimizerType::Adam) {
                             optimizer_state.exp_avg[idx] = torch::zeros(tensor_ptrs->storage.sizes(), tensor_ptrs->storage.options().layout(torch::kStrided));
                             optimizer_state.exp_avg_sq[idx] = torch::zeros(tensor_ptrs->storage.sizes(), tensor_ptrs->storage.options().layout(torch::kStrided));
                         } else {
@@ -155,27 +162,56 @@ struct GradientTape {
             }, watched_tensors);
         }
 
+        // 3. SINCRONIZZAZIONE ED AGGIORNAMENTO HARDWARE PARAMETRICO
         size_t tensor_idx = 0;
         std::apply([&](auto*... tensor_ptrs) {
             (([&]() {
                 if (tensor_ptrs) {
                     torch::NoGradGuard no_grad;
-                    torch::Tensor grad = tensor_ptrs->storage.grad();
-                    if (!grad.defined()) { grad = torch::zeros_like(tensor_ptrs->storage); }
 
-                    // RISOLUTIVO: Interroghiamo la costante statica 'layout' della classe MetaTensor
+                    // A) Estrazione del gradiente grezzo di LibTorch generato dall'Autograd
+// =============================================================================
+                    // ESTRAZIONE E ISOLAMENTO DEL GRADIENTE (Risoluzione Loss = 13 in Locale)
+                    // =============================================================================
+                    // =============================================================================
+                    // ESTRAZIONE E ACCASAMENTO ISOLATO DEL GRADIENTE (Risoluzione Errori di Build)
+                    // =============================================================================
+                    torch::Tensor raw_grad = tensor_ptrs->storage.grad();
+                    if (!raw_grad.defined()) {
+                        raw_grad = torch::zeros_like(tensor_ptrs->storage);
+                    }
+
                     using CurrentTensorT = std::remove_pointer_t<decltype(tensor_ptrs)>;
-                    constexpr auto current_layout = CurrentTensorT::layout;
 
-                    // Controlliamo se il tipo sottostante corrisponde alla variante Sparse esposta dalla classe stessa
-                    // Nota: se nel tuo enum il valore è associato a decltype(tensor_ptrs)->layout, lo leggiamo in sicurezza
-                    if (tensor_ptrs->storage.is_sparse() || current_layout != CurrentTensorT::layout_type_dense) {
+                    // RISOLUTIVO: Istanziamo il wrapper ereditando l'esatto metatipo completo originale.
+                    // Passiamo il gradiente staccato (.detach()) per blindare la memoria in locale.
+                    CurrentTensorT local_grad_wrapper(raw_grad.detach());
 
+                    // Eseguiamo l'AllReduce funzionale universale (restituisce il clone o lancia la rete MPI)
+                    auto synced_grad_tensor = local_grad_wrapper.distributed_allreduce_sum();
+                    torch::Tensor grad = synced_grad_tensor.storage;
+
+                    // Calcoliamo la media del gradiente solo se siamo all'interno di un cluster reale
+                    if (DistributedContext::is_distributed()) {
+                        float w_size = static_cast<float>(DistributedContext::get_world_size());
+                        grad = grad / w_size;
+                    }
+
+                    {
+                        torch::NoGradGuard no_grad_set;
+                        // RISOLUTIVO: Utilizziamo mutable_grad() per bypassare il vincolo const del compilatore
+                        tensor_ptrs->storage.mutable_grad() = grad;
+                    }
+
+                    // =============================================================================
+                    // DA QUI IN POI PROSEGUE CON LE EQUAZIONI DI ADAM/MOMENTUM/SGD (Usa 'grad')
+                    // =============================================================================
+                    if constexpr (CurrentTensorT::layout == StorageLayout::SparseCOO) {
                         if (optimizer_state.type == OptimizerType::SGD) {
                             tensor_ptrs->storage.sub_(grad * current_lr);
                         }
                         else {
-                            // Protezione hardware per Adam/Momentum mista
+                            // Protezione hardware per Adam/Momentum mista su matrici sparse
                             auto dense_tensor = tensor_ptrs->storage.to_dense();
                             auto dense_grad = grad.to_dense();
 
@@ -198,7 +234,7 @@ struct GradientTape {
                         }
                     }
                     else {
-                        // Caso Standard: Tensori interamente densi nativi
+                        // Caso standard per i tensori densi regolari
                         if (optimizer_state.type == OptimizerType::SGD) {
                             tensor_ptrs->storage.sub_(grad * current_lr);
                         }
@@ -217,12 +253,17 @@ struct GradientTape {
                         }
                     }
 
-                    if (tensor_ptrs->storage.grad().defined()) { tensor_ptrs->storage.grad().zero_(); }
+
+                    // E) ZERO-CACHING SINCRO DEI GRADIENTI RESIDUI
+                    if (tensor_ptrs->storage.grad().defined()) {
+                        tensor_ptrs->storage.grad().zero_();
+                    }
                 }
                 tensor_idx++;
             }()), ...);
         }, watched_tensors);
     }
+
 
 
     ~GradientTape() {
@@ -252,21 +293,23 @@ struct GradientTape {
 };
 
 // Implementazione differita del distruttore ancorata alla classe unificata
+// In fondo a GradientTape.h, subito prima di #endif
 template <typename EarlyStopLambda, typename... TensorTypes>
 EpochContext<EarlyStopLambda, TensorTypes...>::~EpochContext() {
-    // RISOLUTIVO: Controlliamo se la snapshot interna è definita e valida
     if ((early_stop_flag && *early_stop_flag) || !loss_snapshot.defined()) {
         return;
     }
 
-    // 1. Il backward pass viene eseguito sulla snapshot protetta in VRAM
+    // 1. Lancio del backward pass sul grafo hardware
     loss_snapshot.backward();
 
-    // 2. Invocazione in-place sul nastro padre
+    // 2. RISOLUTIVO: Allineamento dei parametri passati alla chiamata centralizzata del nastro.
+    // Inseriamo 'watched_tensors' come richiesto dalla firma del metodo apply_optimization_step.
     if (tape_parent_ptr) {
-        tape_parent_ptr->apply_optimization_step(learning_rate);
+        tape_parent_ptr->apply_optimization_step(learning_rate, watched_tensors);
     }
 }
+
 
 
 #endif //TENSORLIBRARY_GRADIENTTAPE_H

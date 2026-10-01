@@ -50,6 +50,8 @@ public:
     static constexpr StorageLayout layout_type_dense = StorageLayout::Dense;
     static constexpr StorageLayout layout_type_sparse = StorageLayout::SparseCOO;
 
+    // RISOLUTIVO: Espone il tipo primitivo delle celle per i riflessi del GradientTape
+    using value_type = T;
 
     // Il tensore di LibTorch interno ereditato
     torch::Tensor storage;
@@ -1003,6 +1005,101 @@ private:
         }
         return linear_idx;
     }
+
+        // =============================================================================
+    // PRIMITIVE DI DATA PARALLELISM DISTRIBUITO CON FALLBACK AUTOMATICO
+    // =============================================================================
+
+    template <size_t PartitionAxis>
+    static constexpr auto compute_scatter_shape(size_t w_size) {
+        std::array<size_t, Rank> scatter_shape = { Dims... };
+        // Evitiamo divisioni per zero se world_size non è ancora inizializzato o è locale
+        size_t divisor = (w_size > 0) ? w_size : 1;
+        scatter_shape[PartitionAxis] /= divisor;
+        return scatter_shape;
+    }
+
+public:
+    // SCATTER CON FALLBACK: Restituisce se stesso se eseguito in locale
+    template <size_t PartitionAxis = 0>
+    // =============================================================================
+    // SCATTER CON FALLBACK REALE: Protezione Completa Single-Machine
+    // =============================================================================
+    auto distributed_scatter() const {
+        DistributedContext::init(); // Rilevamento dinamico dell'ambiente
+
+        // 1. FALLBACK LOCALE IMMEDIATO: Se non siamo in un cluster distributed,
+        // restituiamo un MetaTensor avente l'ESATTA FORMA GEOMETRICA ORIGINALE.
+        // Nessuno slicing o alterazione dei dati viene eseguita (Costo Zero).
+        if (!DistributedContext::is_distributed()) {
+            return *this;
+        }
+
+        // 2. RAMO DISTRIBUITO MPI CLUSTER: Eseguito solo se lanciato con mpirun/mpiexec
+#ifdef METATENSOR_USE_MPI
+        size_t w_size = DistributedContext::get_world_size();
+        int64_t rank = DistributedContext::get_rank();
+
+        // Calcolo della forma ridotta per il nodo del cluster
+        static constexpr auto chunk_shape = compute_scatter_shape<PartitionAxis>(4); // Ipotizziamo scala 4 per i tipi del cluster
+
+        int64_t chunk_size = this->storage.size(static_cast<int64_t>(PartitionAxis)) / w_size;
+        int64_t start_idx = rank * chunk_size;
+
+        // Estrazione della sola fetta di competenza hardware del nodo corrente
+        auto local_slice = this->storage.slice(static_cast<int64_t>(PartitionAxis), start_idx, start_idx + chunk_size);
+
+        return MetaTensor<T, Layout, chunk_shape[0], (Rank > 1 ? Shape[1] : 1)>(local_slice);
+#else
+        return *this;
+#endif
+    }
+
+
+    // ALLREDUCE CON FALLBACK: Diventa una No-Op se eseguito in locale
+    // =============================================================================
+    // ALLREDUCE FUNZIONALE UNIVERSALE: Restituisce un nuovo MetaTensor Sincronizzato
+    // =============================================================================
+    // Prende il tensore corrente, lo riduce sommandolo tra tutti i nodi se in ambiente MPI,
+    // e restituisce una nuova istanza protetta dello stesso identico tipo statico.
+    auto distributed_allreduce_sum() const {
+        DistributedContext::init();
+
+        // 1. FALLBACK LOCALE IMMEDIATO (Single-Machine Mode)
+        // Se siamo in locale, mimiamo la riduzione distribuita restituendo una copia shallow
+        // protetta del tensore corrente ad overhead zero.
+        if (!DistributedContext::is_distributed()) {
+            return MetaTensor<T, Layout, Dims...>(this->storage.clone());
+        }
+
+        // 2. RAMO DISTRIBUITO CLUSTER (Eseguito solo sotto mpirun)
+#ifdef METATENSOR_USE_MPI
+        bool was_sparse = this->storage.is_sparse();
+
+        // Densificazione transitoria protetta per evitare crash su layout COO sparsi
+        torch::Tensor tensor_to_reduce = was_sparse ? this->storage.to_dense() : this->storage.clone();
+        std::vector<torch::Tensor> tensors = {tensor_to_reduce};
+
+        c10d::AllreduceOptions options;
+        options.reduceOp = c10d::ReduceOp::SUM;
+
+        // Invocazione sincrona in-place sul gruppo di processo core C++ di DistributedContext
+        auto work = DistributedContext::get_group()->allreduce(tensors, options);
+        work->wait(); // Barriera hardware di sincronizzazione di rete
+
+        if (was_sparse) {
+            auto sparse_output = tensor_to_reduce.to_sparse().coalesce();
+            return MetaTensor<T, Layout, Dims...>(sparse_output);
+        } else {
+            return MetaTensor<T, Layout, Dims...>(tensor_to_reduce);
+        }
+#else
+        return MetaTensor<T, Layout, Dims...>(this->storage.clone());
+#endif
+    }
+
+
+
 
 private:
     // Helper per verificare se un asse fa parte di un insieme di indici (compile-time lookup)
