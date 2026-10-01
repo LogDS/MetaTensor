@@ -1,0 +1,45 @@
+[build-system]
+# Scikit-build-core sostituisce setuptools per la gestione nativa di CMake + nanobind
+requires = [
+    "scikit-build-core>=0.8.0",
+    "nanobind>=2.0.0",
+    "torch", # Necessario per fare in modo che CMake trovi i file di configurazione di LibTorch
+    "cmake>=3.26",
+    "ninja"
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "metatensor_py"
+version = "3.0.0"
+description = "Motore Algebrico-Relazionale staticamente tipizzato C++26 basato su OpenXLA e LibTorch"
+requires-python = ">=3.10"
+authors = [
+    { name = "Giacomo Bergami, PhD", email = "bergamigiacomo@gmail.com" }
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+
+# Dipendenze runtime richieste dall'utente finale Python
+dependencies = [
+    "numpy>=1.22.0",
+    "torch>=2.0.0"
+]
+
+[tool.scikit-build]
+# Forza scikit-build-core ad applicare una build di Release ottimizzata di default
+cmake.build-type = "Release"
+# Indica a CMake dove posizionare i file di configurazione dei moduli Python esportati
+wheel.packages = ["src/py/metatensor_py"]
+cmake.args = ["-DCMAKE_CXX_STANDARD=26"] # oppure 20 se usi C++20
+cmake.version = ">=3.26"
+ninja.version = ">=1.11"

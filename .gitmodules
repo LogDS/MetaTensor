@@ -1,0 +1,9 @@
+[submodule "submodules/catch2"]
+	path = submodules/catch2
+	url = https://github.com/catchorg/catch2
+[submodule "submodules/indicators"]
+	path = submodules/indicators
+	url = https://github.com/p-ranav/indicators
+[submodule "submodules/nanobind"]
+	path = submodules/nanobind
+	url = https://github.com/wjakob/nanobind
