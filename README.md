@@ -213,3 +213,4 @@ This project is licensed under the terms of the GNU General Public License v3 (G
 ## 👥 Authors and Contacts
  *  Author: Giacomo Bergami, PhD
  * Repository: github.com/logds/metatensor
+

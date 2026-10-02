@@ -25,6 +25,7 @@
 #include <utility>
 #include <cmath>
 #include <functional>
+#include <logds/metatensor/StorageLayout.h>
 #include <logds/metatensor/DistributedContext.h>
 
 // Forward Declaration del Nastro fortemente tipizzato

@@ -11,6 +11,31 @@ else()
     message(STATUS "[MetaTensor] Running in Single-Machine Local mode (Distributed disabled)")
 endif()
 
+# 1. Tentativo di trovare libgccjit usando i percorsi di sistema standard
+find_path(LIBGCCJIT_INCLUDE_DIR NAMES libgccjit.h
+        PATHS
+        /usr/lib/gcc/x86_64-linux-gnu/12/include
+        /usr/include
+)
+
+find_library(LIBGCCJIT_LIBRARY NAMES gccjit
+        PATHS
+        /usr/lib/gcc/x86_64-linux-gnu/12
+        /usr/lib/x86_64-linux-gnu
+        /usr/lib
+)
+
+include_directories(submodules/antlr4/runtime/Cpp/runtime/src)
+include_directories(src/antlr4/)
+
+# Gestisce i messaggi di errore se la libreria non viene trovata
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(LibGccJit
+        REQUIRED_VARS LIBGCCJIT_LIBRARY LIBGCCJIT_INCLUDE_DIR
+)
+
+include_directories(${LIBGCCJIT_INCLUDE_DIR})
+
 # 1. Uniforma i percorsi di ricerca di CMake per CUDA 13.2 prima di trovare i pacchetti
 set(CMAKE_CUDA_COMPILER "/usr/local/cuda-13.2/bin/nvcc")
 set(CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda-13.2")
@@ -58,6 +83,7 @@ include_directories(submodules/catch2/src)
 include_directories(submodules/indicators/include)
 add_subdirectory(submodules/catch2)
 add_subdirectory(submodules/nanobind)
+include_directories(submodules/Mach7/code)
 
 # --- Configurazione dei singoli Target con isolamento C++26 (o C++2c per GCC 12) ---
 
@@ -102,3 +128,8 @@ apply_maximum_cxx_standard(distributed_gradient_descent)
 #)
 #apply_maximum_cxx_standard(metatensor_core) # Forzerà la modalità C++2c/26 abilitando i fold expression
 #install(TARGETS metatensor_core LIBRARY DESTINATION .)
+add_library(MetaTensorJIT
+        src/cpp/logds/tensormetadata/JitShapeInferenceEngine.cpp
+        src/cpp/logds/tensormetadata/Mach7ShapeInferenceBridge.cpp
+)
+target_link_libraries(MetaTensorJIT )

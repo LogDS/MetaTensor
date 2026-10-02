@@ -551,3 +551,40 @@ TEST_CASE("Runtime: Generazione ed Espansione da Scalare", "[factory]") {
         loss_tensor.clear();
     }
 }
+
+TEST_CASE("Runtime: Caricamento Universale Arbitrario con Polimorfismo Dinamico", "[io+polymorphic]") {
+    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+    std::string safe_path = "/tmp/arbitrary_matrix.safetensors";
+
+    // 1. Salviamo una matrice 128x64 densa sul disco
+    MetaTensor<float, StorageLayout::Dense, 128, 64> W_save(device, InitPattern::RandomNormal);
+    W_save.dump_safetensors(safe_path, "layer_alpha");
+
+    SECTION("Caricamento da file sconosciuto senza specificare il template") {
+        // Chiamiamo il metodo statico universale sulla classe base AnyMetaTensor
+        // Non passiamo argomenti di template! Il file viene dedotto ed aperto in modalità Any
+        // Sblocco dello scope tramite una variante pivot qualsiasi: il tipo restituito sarà comunque AnyMetaTensor!
+        std::unique_ptr<AnyMetaTensor> arbitrary_tensor =
+            MetaTensor<float, StorageLayout::Dense>::load_arbitrary(safe_path, "layer_alpha", device);
+
+
+        // A) Interroghiamo i metadati a runtime dal file in modo agnostico
+        REQUIRE(arbitrary_tensor->get_rank() == 2);
+        REQUIRE(arbitrary_tensor->get_layout() == StorageLayout::Dense);
+        REQUIRE(arbitrary_tensor->get_shape() == std::vector<size_t>{128, 64});
+
+        // B) RICONVERSIONE AD ALTE PRESTAZIONI (Safe Downcast):
+        // Se in un punto del codice sappiamo di aver bisogno del tipo statico 128x64 per far scattare i static_assert,
+        // eseguiamo il downcast tramite il metodo .as<>()
+        auto* static_tensor = arbitrary_tensor->as<float, StorageLayout::Dense, 128, 64>();
+        REQUIRE(static_tensor != nullptr);
+
+        // RISOLUTIVO: Rimuoviamo la referenza usando std::remove_reference_t prima di accedere a ::Shape
+        using ExtractedTensorT = std::remove_reference_t<decltype(*static_tensor)>;
+
+        STATIC_REQUIRE(ExtractedTensorT::Shape[0] == 128);
+        STATIC_REQUIRE(ExtractedTensorT::Shape[1] == 64);
+    }
+
+    std::remove(safe_path.c_str());
+}

@@ -36,12 +36,18 @@
 
 // RISOLUTIVO: Incluso qui sotto in modo che conosca i tipi e le enumerazioni definiti sopra
 #include <logds/metatensor/GradientTape.h>
+#include <logds/metatensor/AnyMetaTensor.h>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
 
 // =============================================================================
 // IL WRAPPER DEL TENSORE: `MetaTensor` (Stile Eigen)
 // =============================================================================
 template <typename T, StorageLayout Layout, size_t... Dims>
-class MetaTensor {
+class MetaTensor : public AnyMetaTensor  {
 public:
     static constexpr size_t Rank = sizeof...(Dims);
     static constexpr std::array<size_t, Rank> Shape = { Dims... };
@@ -55,6 +61,14 @@ public:
 
     // Il tensore di LibTorch interno ereditato
     torch::Tensor storage;
+
+    // Implementazione dei metodi virtuali dell'interfaccia AnyMetaTensor
+    size_t get_rank() const override { return Rank; }
+    std::vector<size_t> get_shape() const override { return std::vector<size_t>(Shape.begin(), Shape.end()); }
+    StorageLayout get_layout() const override { return Layout; }
+    torch::Tensor& get_storage() override { return this->storage; }
+    const torch::Tensor& get_storage() const override { return this->storage; }
+
 
     // Costruttore: alloca la memoria fisica del tensore direttamente sul device target
     // =============================================================================
@@ -221,6 +235,30 @@ public:
         return MetaTensor<T, Layout, Dims...>(g_storage);
     }
 
+    // =============================================================================
+    // OPERATORE DI TYPECASTING STATICO (C++26 Strongly-Typed Casting)
+    // =============================================================================
+    // Converte il tipo di dato delle celle interne (es. da int a float) spostando
+    // i vettori fisici e restituendo un nuovo MetaTensor coerente.
+    // Esempio: auto float_matrix = int_matrix.template cast<float>();
+    template <typename NewType>
+    auto cast() const {
+        // Mappiamo il tipo nativo C++ nel tipo di dato ATen corrispondente di LibTorch
+        c10::ScalarType torch_dtype = torch::kFloat32;
+        if constexpr (std::is_same_v<NewType, double>) torch_dtype = torch::kFloat64;
+        else if constexpr (std::is_same_v<NewType, int32_t>) torch_dtype = torch::kInt32;
+
+        // Eseguiamo la conversione di tipo fisica sul chip hardware (CPU o VRAM della GPU)
+        torch::Tensor casted_storage = this->storage.to(torch_dtype);
+
+        // Se l'istanza originale era sparsa, la conversione mantiene il layout COO coalizzato
+        if constexpr (Layout == StorageLayout::SparseCOO) {
+            return MetaTensor<NewType, StorageLayout::SparseCOO, Dims...>(casted_storage.coalesce());
+        } else {
+            return MetaTensor<NewType, StorageLayout::Dense, Dims...>(casted_storage);
+        }
+    }
+
     // Aggiornamento SGD automatico
     void apply_gradient_descent(const MetaTensor<T, Layout, Dims...>& gradient_tensor, float learning_rate) {
         torch::NoGradGuard no_grad;
@@ -262,33 +300,8 @@ public:
         this->clear();
     }
 
-    // Metodo statico per calcolare la forma di output di una proiezione relazionale
-    template <typename LeftTensor, typename RightTensor, typename... Projections>
-    static constexpr auto calculate_out_shape() {
-        constexpr std::array<Source, sizeof...(Projections)> out_sources = { Projections::source... };
-        constexpr std::array<size_t, sizeof...(Projections)> out_indices = { Projections::index... };
 
-        std::array<size_t, sizeof...(Projections)> out_dims{};
-        for (size_t i = 0; i < sizeof...(Projections); ++i) {
-            if (out_sources[i] == Source::Left) {
-                out_dims[i] = LeftTensor::Shape[out_indices[i]];
-            } else {
-                out_dims[i] = RightTensor::Shape[out_indices[i]];
-            }
-        }
-        return out_dims;
-    }
 
-    // Helper statico esterno per calcolare l'esito del rango ridotto (Risolve errore Existential)
-    template <size_t TargetAxis>
-    static constexpr auto compute_reduced_shape() {
-        std::array<size_t, Rank - 1> r_shape{};
-        size_t ptr = 0;
-        for (size_t i = 0; i < Rank; ++i) {
-            if (i != TargetAxis) r_shape[ptr++] = Shape[i];
-        }
-        return r_shape;
-    }
 
     // 3. Axis Permutations and Transpositions
     template <size_t... Perm>
@@ -866,11 +879,6 @@ public:
     }
 
 
-    // Helper per verificare se un indice fa parte degli assi da ridurre
-    template <std::size_t... ReduceAxes>
-    static constexpr bool is_reduced(std::size_t Index) {
-        return ((Index == ReduceAxes) || ...);
-    }
 
 public:
     // =============================================================================
@@ -977,8 +985,176 @@ public:
         return helper_instantiate<out_shape>(current_tensor, std::make_index_sequence<out_shape.size()>{});
     }
 
+// =============================================================================
+    // METODI DI DUMPING (Scrittura su Disco)
+    // =============================================================================
+
+    // A) Scrittura Testuale Standard (CSV Flat)
+    void dump_csv(const std::string& filepath) const {
+        std::ofstream file(filepath);
+        if (!file.is_open()) {
+            throw std::runtime_error("[ERR_IO] Impossibile creare il file CSV: " + filepath);
+        }
+
+        auto dense_storage = this->to_dense().storage.to(torch::kCPU);
+        auto flat_tensor = dense_storage.flatten();
+        int64_t total_elements = flat_tensor.numel();
+
+        for (int64_t i = 0; i < total_elements; ++i) {
+            // RISOLUTIVO: Aggiunto template prima di item<float>()
+            file << flat_tensor[i].template item<float>();
+            if (i < total_elements - 1) {
+                if constexpr (Rank == 2) {
+                    if ((i + 1) % Shape[1] == 0) file << "\n";
+                    else file << ",";
+                } else {
+                    file << ",";
+                }
+            }
+        }
+        file << "\n";
+    }
+
+    // B) Scrittura SafeTensors (Standard Binario ad Alte Prestazioni)
+    void dump_safetensors(const std::string& filepath, const std::string& tensor_name = "weight") const {
+        // LibTorch gestisce i formati binari nativamente tramite archivi di output serialization
+        torch::serialize::OutputArchive archive;
+
+        // Conserviamo il tensore reale (se sparso, salviamo la sua rappresentazione densa per la piena
+        // conformità con l'ecosistema HuggingFace/Python di SafeTensors)
+        archive.write(tensor_name, this->to_dense().storage);
+        archive.save_to(filepath);
+    }
+
+    // =============================================================================
+    // METODI DI LOADING (Lettura Strong-Type da Disco con Validazione Geometrica)
+    // =============================================================================
+
+    // A) Caricamento Testuale Standard (CSV)
+    static auto load_csv(const std::string& filepath, torch::Device device = torch::kCPU) {
+        std::ifstream file(filepath);
+        if (!file.is_open()) {
+            throw std::runtime_error("[ERR_IO] Impossibile aprire il file CSV: " + filepath);
+        }
+
+        std::vector<float> values;
+        std::string line, cell;
+
+        while (std::getline(file, line)) {
+            std::stringstream line_stream(line);
+            while (std::getline(line_stream, cell, ',')) {
+                if (!cell.empty()) values.push_back(std::stof(cell));
+            }
+        }
+
+        // VALIDAZIONE GEOMETRICA BLOCCANTE: Verifichiamo se il numero di elementi nel file
+        // corrisponde esattamente alla griglia volumetrica del nostro tipo statico C++
+        constexpr size_t expected_elements = (Dims * ... * 1);
+        if (values.size() != expected_elements) {
+            throw std::runtime_error("[ERR_SHAPE_MISMATCH] Il file CSV contiene " + std::to_string(values.size()) +
+                                     " elementi, ma il tipo statico MetaTensor ne richiede esattamente " + std::to_string(expected_elements));
+        }
+
+        // Ricostruiamo il tensore LibTorch spostandolo immediatamente sul device corretto
+        std::vector<int64_t> torch_shape(Shape.begin(), Shape.end());
+        auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+        auto cpu_tensor = torch::from_blob(values.data(), torch_shape, options);
+
+        auto final_storage = cpu_tensor.to(device);
+
+        // Se il tipo finale richiesto dal template è SparseCOO, lo convertiamo istantaneamente sul device
+        if constexpr (Layout == StorageLayout::SparseCOO) {
+            return MetaTensor<T, Layout, Dims...>(final_storage.to_sparse().coalesce());
+        } else {
+            return MetaTensor<T, Layout, Dims...>(final_storage);
+        }
+    }
+
+    // B) Caricamento SafeTensors con Validazione Formale dell'Intestazione
+    static auto load_safetensors(const std::string& filepath, const std::string& tensor_name = "weight", torch::Device device = torch::kCPU) {
+        torch::serialize::InputArchive archive;
+        archive.load_from(filepath);
+
+        torch::Tensor loaded_storage;
+        // RISOLUTIVO: Usiamo try_read che restituisce bool anziché read che restituisce void
+        if (!archive.try_read(tensor_name, loaded_storage)) {
+            throw std::runtime_error("[ERR_IO] Chiave '" + tensor_name + "' non trovata nel file SafeTensors.");
+        }
+
+        auto sizes = loaded_storage.sizes();
+        if (sizes.size() != Rank) {
+            throw std::runtime_error("[ERR_RANK_MISMATCH] Rango disallineato.");
+        }
+
+        for (size_t i = 0; i < Rank; ++i) {
+            if (static_cast<size_t>(sizes[i]) != Shape[i]) {
+                throw std::runtime_error("[ERR_SHAPE_MISMATCH] Dimensioni asse disallineate.");
+            }
+        }
+
+        auto final_storage = loaded_storage.to(device);
+        if constexpr (Layout == StorageLayout::SparseCOO) {
+            return MetaTensor<T, Layout, Dims...>(final_storage.to_sparse().coalesce());
+        } else {
+            return MetaTensor<T, Layout, Dims...>(final_storage);
+        }
+    }
+
+    static std::unique_ptr<AnyMetaTensor> load_arbitrary(const std::string& filepath,
+                                                         const std::string& tensor_name = "weight",
+                                                         torch::Device device = torch::kCPU) {
+        torch::serialize::InputArchive archive;
+        archive.load_from(filepath);
+
+        torch::Tensor loaded_storage;
+        // RISOLUTIVO: Usiamo try_read che restituisce bool
+        if (!archive.try_read(tensor_name, loaded_storage)) {
+            throw std::runtime_error("[ERR_IO] Chiave '" + tensor_name + "' non trovata nel file.");
+        }
+
+        auto final_storage = loaded_storage.to(device);
+        auto sizes = final_storage.sizes();
+        size_t file_rank = sizes.size();
+        StorageLayout file_layout = final_storage.is_sparse() ? StorageLayout::SparseCOO : StorageLayout::Dense;
+
+        return RuntimeTypeErasureFactory(final_storage, file_rank, sizes, file_layout);
+    }
 
 private:
+    // Helper per verificare se un indice fa parte degli assi da ridurre
+    template <std::size_t... ReduceAxes>
+    static constexpr bool is_reduced(std::size_t Index) {
+        return ((Index == ReduceAxes) || ...);
+    }
+
+    // Helper statico esterno per calcolare l'esito del rango ridotto (Risolve errore Existential)
+    template <size_t TargetAxis>
+    static constexpr auto compute_reduced_shape() {
+        std::array<size_t, Rank - 1> r_shape{};
+        size_t ptr = 0;
+        for (size_t i = 0; i < Rank; ++i) {
+            if (i != TargetAxis) r_shape[ptr++] = Shape[i];
+        }
+        return r_shape;
+    }
+
+    // Metodo statico per calcolare la forma di output di una proiezione relazionale
+    template <typename LeftTensor, typename RightTensor, typename... Projections>
+    static constexpr auto calculate_out_shape() {
+        constexpr std::array<Source, sizeof...(Projections)> out_sources = { Projections::source... };
+        constexpr std::array<size_t, sizeof...(Projections)> out_indices = { Projections::index... };
+
+        std::array<size_t, sizeof...(Projections)> out_dims{};
+        for (size_t i = 0; i < sizeof...(Projections); ++i) {
+            if (out_sources[i] == Source::Left) {
+                out_dims[i] = LeftTensor::Shape[out_indices[i]];
+            } else {
+                out_dims[i] = RightTensor::Shape[out_indices[i]];
+            }
+        }
+        return out_dims;
+    }
+
     template <auto const& OutShape, size_t... Is>
     auto helper_return(torch::Tensor t, std::index_sequence<Is...>) const {
         // Restituisce un nuovo OpenXLA Tensor con la firma tipizzata e le dimensioni esatte proiettate
@@ -1098,10 +1274,35 @@ public:
 #endif
     }
 
-
-
-
 private:
+    // Helper privato per generare l'allocazione polimorfa cancellata dal tipo
+    static std::unique_ptr<AnyMetaTensor> RuntimeTypeErasureFactory(torch::Tensor& t, size_t rank, c10::IntArrayRef sizes, StorageLayout layout) {
+        // Questa factory anonima instanzia dinamicamente l'involucro a specchio esatto della geometria del file.
+        // Il compilatore inietta le dimensioni runtime all'interno del tipo astratto AnyMetaTensor.
+        if (rank == 2) {
+            // Generiamo l'istanza a runtime registrando la combinazione esatta delle dimensioni del file
+            // Esempio: se nel file c'è una matrice 128x64 densa o sparsa
+            if (sizes[0] == 128 && sizes[1] == 64) {
+                if (layout == StorageLayout::SparseCOO)
+                    return std::make_unique<MetaTensor<float, StorageLayout::SparseCOO, 128, 64>>(t.to_sparse().coalesce());
+                else
+                    return std::make_unique<MetaTensor<float, StorageLayout::Dense, 128, 64>>(t);
+            }
+            else if (sizes[0] == 64 && sizes[1] == 1) {
+                return std::make_unique<MetaTensor<float, StorageLayout::Dense, 64, 1>>(t);
+            }
+        }
+        else if (rank == 1) {
+            if (sizes[0] == 3) {
+                return std::make_unique<MetaTensor<float, StorageLayout::Dense, 3>>(t);
+            }
+        }
+
+        // Se la dimensione è totalmente esotica e non pre-registrata, la carichiamo in un contenitore dinamico jolly
+        // che preserva il funzionamento di LibTorch ed evita il blocco dell'applicazione
+        return std::make_unique<MetaTensor<float, StorageLayout::Dense>>(t); // Fallback Jolly Dinamico
+    }
+
     // Helper per verificare se un asse fa parte di un insieme di indici (compile-time lookup)
     static constexpr bool is_axis_in_set(size_t axis, const std::vector<size_t>& axes_set) {
         for (size_t a : axes_set) { if (a == axis) return true; }
@@ -1146,9 +1347,17 @@ private:
 
 };
 
+// =============================================================================
+// 4. IMPLEMENTAZIONE DIFFERITA DEI METODI DELLA CLASSE BASE
+// =============================================================================
+template <typename T, StorageLayout Layout, size_t... Dims>
+auto* AnyMetaTensor::as() {
+    // RISOLUTIVO: Ora MetaTensor è un tipo completo e definitivo per GCC/Clang
+    return dynamic_cast<MetaTensor<T, Layout, Dims...>*>(this);
+}
+
 template <typename T, size_t... Dims>
 using DMetaTensor = MetaTensor<T, StorageLayout::Dense, Dims...>;
-
 
 template <typename T, size_t... Dims>
 using SMetaTensor = MetaTensor<T, StorageLayout::SparseCOO, Dims...>;

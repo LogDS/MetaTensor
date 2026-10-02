@@ -7,3 +7,9 @@
 [submodule "submodules/nanobind"]
 	path = submodules/nanobind
 	url = https://github.com/wjakob/nanobind
+[submodule "submodules/antlr4"]
+	path = submodules/antlr4
+	url = https://github.com/antlr/antlr4
+[submodule "submodules/Mach7"]
+	path = submodules/Mach7
+	url = https://github.com/solodon4/Mach7/
