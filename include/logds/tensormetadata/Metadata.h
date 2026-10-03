@@ -1,9 +1,24 @@
-//
-// Created by gyankos on 02/10/26.
-//
+/*
+* This file is part of the MetaTensor distribution (https://github.com/logds/MetaTensor).
+ * Copyright (c) 2026 Giacomo Bergami, PhD
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
 
 #ifndef TENSORLIBRARY_JITASTNODES_H
 #define TENSORLIBRARY_JITASTNODES_H
+
+
 
 
 #include <logds/metatensor/StorageLayout.h>
@@ -16,6 +31,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+
 
 typedef enum {
     TYPE_FLOAT,
@@ -32,119 +49,112 @@ typedef struct {
 } JitTensorMetadata;
 
 
+#include <string>
+#include <vector>
+#include <memory>
 
-
-
-
-// Classe base polimorfa per i nodi del grafo
-struct AstNode {
-    virtual ~AstNode() = default;
+// Classe base polimorfa abilitata per lo shared_from_this se necessario
+struct TensorTyping {
+    virtual ~TensorTyping() = default;
 };
 
-// Foglie del Grafo
-struct VariableNode : AstNode {
+// Alias di produzione per eliminare i memory leak nell'albero ANTLR4
+using TypingNodePtr = std::shared_ptr< TensorTyping>;
+
+// Foglie dell'Albero
+struct VariableNode : TensorTyping {
     std::string name;
     JitTensorMetadata metadata;
     VariableNode(std::string n, JitTensorMetadata m) : name(n), metadata(m) {}
 };
 
-struct LoadSafeNode : AstNode {
+struct LoadSafeNode : TensorTyping {
     std::string filepath;
     std::string layer;
     LoadSafeNode(std::string f, std::string l) : filepath(f), layer(l) {}
 };
 
-struct FromScalarNode : AstNode {
+struct FromScalarNode : TensorTyping {
     float value;
     DataType target_type;
     FromScalarNode(float v, DataType dt) : value(v), target_type(dt) {}
 };
 
-// Operatori Binari Element-wise e Relazionali
-struct AddNode       : AstNode { AstNode* left; AstNode* right; AddNode(AstNode* l, AstNode* r) : left(l), right(r) {} };
-struct SubNode       : AstNode { AstNode* left; AstNode* right; SubNode(AstNode* l, AstNode* r) : left(l), right(r) {} };
-struct MatMulNode    : AstNode { AstNode* left; AstNode* right; MatMulNode(AstNode* l, AstNode* r) : left(l), right(r) {} };
-struct CrossNode     : AstNode { AstNode* left; AstNode* right; CrossNode(AstNode* l, AstNode* r) : left(l), right(r) {} };
-struct HadamardNode  : AstNode { AstNode* left; AstNode* right; HadamardNode(AstNode* l, AstNode* r) : left(l), right(r) {} };
-struct ThetaJoinNode : AstNode { AstNode* left; AstNode* right; ThetaJoinNode(AstNode* l, AstNode* r) : left(l), right(r) {} };
-struct ContractionNode : AstNode { AstNode* left; AstNode* right; size_t l_axis; size_t r_axis; ContractionNode(AstNode* l, AstNode* r, size_t la, size_t ra) : left(l), right(r), l_axis(la), r_axis(ra) {} };
+// Nodo per il dumping dei pesi (es: dump_safetensors)
+struct DumpSafeNode : TensorTyping {
+    TypingNodePtr tensor_node; // Il sotto-nodo da serializzare (es: W)
+    std::string filepath;
+    std::string tensor_name;
 
-// Operatori Unari e Slicing
-struct ApplyUnaryNode : AstNode { AstNode* child; std::string op_name; ApplyUnaryNode(AstNode* c, std::string op) : child(c), op_name(op) {} };
-struct ReduceSumNode  : AstNode { AstNode* child; size_t axis; ReduceSumNode(AstNode* c, size_t a) : child(c), axis(a) {} };
-struct ReduceAllNode  : AstNode { AstNode* child; ReduceAllNode(AstNode* c) : child(c) {} };
-struct CastingNode    : AstNode { AstNode* child; DataType target_type; CastingNode(AstNode* c, DataType dt) : child(c), target_type(dt) {} };
-struct PrimitiveFloatExtractNode : AstNode { AstNode* child; PrimitiveFloatExtractNode(AstNode* c) : child(c) {} };
-struct SliceTensorNode : AstNode { AstNode* child; size_t axis; uint64_t start; uint64_t end; SliceTensorNode(AstNode* c, size_t ax, uint64_t s, uint64_t e) : child(c), axis(ax), start(s), end(e) {} };
-struct SqueezeAxesNode : AstNode { AstNode* child; size_t axis; SqueezeAxesNode(AstNode* c, size_t ax) : child(c), axis(ax) {} };
-struct SegmentSumNode  : AstNode { AstNode* child; uint64_t num_segments; SegmentSumNode(AstNode* c, uint64_t ns) : child(c), num_segments(ns) {} };
-struct OneHotNode      : AstNode { AstNode* child; uint64_t depth; OneHotNode(AstNode* c, uint64_t d) : child(c), depth(d) {} };
-struct GatherNdNode    : AstNode { AstNode* source; AstNode* indices; GatherNdNode(AstNode* s, AstNode* i) : source(s), indices(i) {} };
-struct WhereNode       : AstNode { AstNode* child; float off_value; WhereNode(AstNode* c, float ov) : child(c), off_value(ov) {} };
-struct BracketsNode    : AstNode { AstNode* child; std::vector<uint64_t> coords; BracketsNode(AstNode* c, std::vector<uint64_t> cc) : child(c), coords(cc) {} };
-
-// Operatori Funzionali Complessi con Predicati
-struct ExistentialQuantifierNode : AstNode { AstNode* child; std::vector<size_t> reduce_axes; ExistentialQuantifierNode(AstNode* c, std::vector<size_t> ra) : child(c), reduce_axes(ra) {} };
-struct UniversalQuantifierNode   : AstNode { AstNode* child; std::vector<size_t> reduce_axes; UniversalQuantifierNode(AstNode* c, std::vector<size_t> ra) : child(c), reduce_axes(ra) {} };
-struct RelationalAggregateNode   : AstNode { AstNode* child; std::vector<size_t> retained_axes; RelationalAggregateNode(AstNode* c, std::vector<size_t> ra) : child(c), retained_axes(ra) {} };
-
-// RISOLUTIVO: Parametrizzazione dell'Epoch Iteration per il GradientTape
-struct EpochIterationNode : AstNode {
-    uint64_t epochs;
-    float base_learning_rate;
-    int64_t optimizer_type; // 0=SGD, 1=Momentum, 2=Adam
-    std::vector<AstNode*> gradient_parameters; // I parametri da ottimizzare (W, b)
-    std::vector<AstNode*> computational_statements; // Le espressioni interne del loop
-
-    EpochIterationNode(uint64_t ep, float lr, int64_t opt, std::vector<AstNode*> params, std::vector<AstNode*> body)
-        : epochs(ep), base_learning_rate(lr), optimizer_type(opt), gradient_parameters(std::move(params)), computational_statements(std::move(body)) {}
+    DumpSafeNode(TypingNodePtr t, std::string f, std::string n)
+        : tensor_node(std::move(t)), filepath(f), tensor_name(n) {}
 };
 
+// Nodo per l'esportazione multi-output (es: export(W, Prediction);)
+struct ExportStatementNode : TensorTyping {
+    std::vector<TypingNodePtr> output_nodes; // La collezione dei molteplici output estratti in tupla
 
-#include <mach7/type_switchN-patterns.hpp> // Support for N-ary Match statement on patterns
-#include <mach7/patterns/address.hpp>      // Address and dereference combinators
-#include <mach7/patterns/bindings.hpp>     // Mach7 support for bindings on arbitrary UDT
-#include <mach7/patterns/constructor.hpp>  // Support for constructor patterns
-#include <mach7/patterns/equivalence.hpp>  // Equivalence combinator +
-#include <mach7/patterns/primitive.hpp>    // Wildcard, variable and value patterns
+    ExportStatementNode(std::vector<TypingNodePtr> nodes)
+        : output_nodes(std::move(nodes)) {}
+};
 
-namespace mch {
-    template <> struct bindings<VariableNode>  { Members(VariableNode::name, VariableNode::metadata); };
-    template <> struct bindings<LoadSafeNode>  { Members(LoadSafeNode::filepath, LoadSafeNode::layer); };
-    template <> struct bindings<FromScalarNode> { Members(FromScalarNode::value, FromScalarNode::target_type); };
+// Operatori Binari Element-wise e Relazionali (RAII Compliant)
+struct AddNode       : TensorTyping { TypingNodePtr left; TypingNodePtr right; AddNode(TypingNodePtr l, TypingNodePtr r) : left(l), right(r) {} };
+struct SubNode       : TensorTyping { TypingNodePtr left; TypingNodePtr right; SubNode(TypingNodePtr l, TypingNodePtr r) : left(l), right(r) {} };
+struct MatMulNode    : TensorTyping { TypingNodePtr left; TypingNodePtr right; MatMulNode(TypingNodePtr l, TypingNodePtr r) : left(l), right(r) {} };
+struct CrossNode     : TensorTyping { TypingNodePtr left; TypingNodePtr right; CrossNode(TypingNodePtr l, TypingNodePtr r) : left(l), right(r) {} };
+struct HadamardNode  : TensorTyping { TypingNodePtr left; TypingNodePtr right; HadamardNode(TypingNodePtr l, TypingNodePtr r) : left(l), right(r) {} };
+struct ThetaJoinNode : TensorTyping { TypingNodePtr left; TypingNodePtr right; ThetaJoinNode(TypingNodePtr l, TypingNodePtr r) : left(l), right(r) {} };
+struct ContractionNode : TensorTyping {
+    TypingNodePtr left; TypingNodePtr right; size_t l_axis; size_t r_axis;
+    ContractionNode(TypingNodePtr l, TypingNodePtr r, size_t la, size_t ra) : left(l), right(r), l_axis(la), r_axis(ra) {}
+};
 
-    template <> struct bindings<AddNode>       { Members(AddNode::left, AddNode::right); };
-    template <> struct bindings<SubNode>       { Members(SubNode::left, SubNode::right); };
-    template <> struct bindings<MatMulNode>    { Members(MatMulNode::left, MatMulNode::right); };
-    template <> struct bindings<CrossNode>     { Members(CrossNode::left, CrossNode::right); };
-    template <> struct bindings<HadamardNode>  { Members(HadamardNode::left, HadamardNode::right); };
-    template <> struct bindings<ThetaJoinNode> { Members(ThetaJoinNode::left, ThetaJoinNode::right); };
-    template <> struct bindings<ContractionNode> { Members(ContractionNode::left, ContractionNode::right, ContractionNode::l_axis, ContractionNode::r_axis); };
+// Operatori Unari e Slicing
+struct ApplyUnaryNode : TensorTyping { TypingNodePtr child; std::string op_name; ApplyUnaryNode(TypingNodePtr c, std::string op) : child(c), op_name(op) {} };
+struct ReduceSumNode  : TensorTyping { TypingNodePtr child; size_t axis; ReduceSumNode(TypingNodePtr c, size_t a) : child(c), axis(a) {} };
+struct ReduceAllNode  : TensorTyping { TypingNodePtr child; ReduceAllNode(TypingNodePtr c) : child(c) {} };
+struct CastingNode    : TensorTyping { TypingNodePtr child; DataType target_type; CastingNode(TypingNodePtr c, DataType dt) : child(c), target_type(dt) {} };
+struct PrimitiveFloatExtractNode : TensorTyping { TypingNodePtr child; PrimitiveFloatExtractNode(TypingNodePtr c) : child(c) {} };
+struct SliceTensorNode : TensorTyping {
+    TypingNodePtr child; size_t axis; uint64_t start; uint64_t end;
+    SliceTensorNode(TypingNodePtr c, size_t ax, uint64_t s, uint64_t e) : child(c), axis(ax), start(s), end(e) {}
+};
+struct SqueezeAxesNode : TensorTyping { TypingNodePtr child; size_t axis; SqueezeAxesNode(TypingNodePtr c, size_t ax) : child(c), axis(ax) {} };
+struct SegmentSumNode  : TensorTyping { TypingNodePtr child; uint64_t num_segments; SegmentSumNode(TypingNodePtr c, uint64_t ns) : child(c), num_segments(ns) {} };
+struct OneHotNode      : TensorTyping { TypingNodePtr child; uint64_t depth; OneHotNode(TypingNodePtr c, uint64_t d) : child(c), depth(d) {} };
+struct GatherNdNode    : TensorTyping { TypingNodePtr source; TypingNodePtr indices; GatherNdNode(TypingNodePtr s, TypingNodePtr i) : source(s), indices(i) {} };
+struct WhereNode       : TensorTyping { TypingNodePtr child; float off_value; WhereNode(TypingNodePtr c, float ov) : child(c), off_value(ov) {} };
+struct BracketsNode    : TensorTyping { TypingNodePtr child; std::vector<uint64_t> coords; BracketsNode(TypingNodePtr c, std::vector<uint64_t> cc) : child(c), coords(cc) {} };
+struct PermuteAxesNode : TensorTyping {
+    TypingNodePtr child;
+    std::vector<std::variant<std::string, uint64_t>> axes;
+    PermuteAxesNode(TypingNodePtr c, std::vector<std::variant<std::string, uint64_t>> ax) : child(c), axes(ax) {}
+};
 
-    template <> struct bindings<ApplyUnaryNode> { Members(ApplyUnaryNode::child, ApplyUnaryNode::op_name); };
-    template <> struct bindings<ReduceSumNode>  { Members(ReduceSumNode::child, ReduceSumNode::axis); };
-    template <> struct bindings<ReduceAllNode>  { Members(ReduceAllNode::child); };
-    template <> struct bindings<CastingNode>    { Members(CastingNode::child, CastingNode::target_type); };
-    template <> struct bindings<PrimitiveFloatExtractNode> { Members(PrimitiveFloatExtractNode::child); };
-    template <> struct bindings<SliceTensorNode> { Members(SliceTensorNode::child, SliceTensorNode::axis, SliceTensorNode::start, SliceTensorNode::end); };
-    template <> struct bindings<SqueezeAxesNode> { Members(SqueezeAxesNode::child, SqueezeAxesNode::axis); };
-    template <> struct bindings<SegmentSumNode>  { Members(SegmentSumNode::child, SegmentSumNode::num_segments); };
-    template <> struct bindings<OneHotNode>      { Members(OneHotNode::child, OneHotNode::depth); };
-    template <> struct bindings<GatherNdNode>    { Members(GatherNdNode::source, GatherNdNode::indices); };
-    template <> struct bindings<WhereNode>       { Members(WhereNode::child, WhereNode::off_value); };
-    template <> struct bindings<BracketsNode>    { Members(BracketsNode::child, BracketsNode::coords); };
+// Operatori Funzionali Complessi con Predicati
+struct ExistentialQuantifierNode : TensorTyping { TypingNodePtr child; std::vector<size_t> reduce_axes; ExistentialQuantifierNode(TypingNodePtr c, std::vector<size_t> ra) : child(c), reduce_axes(ra) {} };
+struct UniversalQuantifierNode   : TensorTyping { TypingNodePtr child; std::vector<size_t> reduce_axes; UniversalQuantifierNode(TypingNodePtr c, std::vector<size_t> ra) : child(c), reduce_axes(ra) {} };
+struct RelationalAggregateNode   : TensorTyping { TypingNodePtr child; std::vector<size_t> retained_axes; RelationalAggregateNode(TypingNodePtr c, std::vector<size_t> ra) : child(c), retained_axes(ra) {} };
 
-    template <> struct bindings<ExistentialQuantifierNode> { Members(ExistentialQuantifierNode::child, ExistentialQuantifierNode::reduce_axes); };
-    template <> struct bindings<UniversalQuantifierNode>   { Members(UniversalQuantifierNode::child, UniversalQuantifierNode::reduce_axes); };
-    template <> struct bindings<RelationalAggregateNode>   { Members(RelationalAggregateNode::child, RelationalAggregateNode::retained_axes); };
+// Il Nastro Parametrico dell'Epoch Iteration (RAII Memory Sandbox)
+struct EpochIterationNode : TensorTyping {
+    uint64_t epochs;
+    float base_learning_rate;
+    int64_t optimizer_type;
+    std::vector<TypingNodePtr> gradient_parameters;
+    std::vector<TypingNodePtr> computational_statements;
 
-    // Binding del Nastro Parametrico delle Epoche
-    template <> struct bindings<EpochIterationNode> {
-        Members(EpochIterationNode::epochs, EpochIterationNode::base_learning_rate,
-                 EpochIterationNode::gradient_parameters,
-                EpochIterationNode::computational_statements);
-    };
-}
+    EpochIterationNode(uint64_t ep, float lr, int64_t opt, std::vector<TypingNodePtr> params, std::vector<TypingNodePtr> body)
+        : epochs(ep), base_learning_rate(lr), optimizer_type(opt), gradient_parameters(params), computational_statements(body) {}
+};
+
+// Nodo Programma Radice Completo
+struct ProgramRootNode : TensorTyping {
+    std::vector<TypingNodePtr> configurations;
+    std::vector<TypingNodePtr> execution_graph;
+    ProgramRootNode(std::vector<TypingNodePtr> c, std::vector<TypingNodePtr> e) : configurations(c), execution_graph(e) {}
+};
 
 
 #endif //TENSORLIBRARY_JITASTNODES_H

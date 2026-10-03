@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.26) # scikit-build-core richiede almeno 3.15+, 
 
 # Opzione per attivare o disattivare il supporto distribuito (Disattivata di default)
 option(METATENSOR_USE_MPI "Build MetaTensor with multi-node MPI cluster support" OFF)
+add_compile_definitions(AT_PER_OPERATOR_HEADERS)
+add_compile_definitions(CAFFE2_USE_GOOGLE_GLOG)
+set(CMAKE_CXX_EXTENSIONS ON) # Abilita gnu++ rispetto a c++ puro, risolve i conflitti di typeid.h
+
 
 if(METATENSOR_USE_MPI)
     # Se attivata dall'utente, iniettiamo la macro di compilazione globale
@@ -78,6 +82,7 @@ find_package(Python 3.13 COMPONENTS Interpreter ${DEV_MODULE} REQUIRED)
 
 # RIMOSSO: set(CMAKE_CXX_STANDARD 26) <- Questa riga rompeva NVCC
 
+include_directories(/home/gyankos/Scaricati/libtorch-shared-with-deps-2.14.0+cu132/libtorch/include)
 include_directories(include)
 include_directories(submodules/catch2/src)
 include_directories(submodules/indicators/include)
@@ -129,7 +134,11 @@ apply_maximum_cxx_standard(distributed_gradient_descent)
 #apply_maximum_cxx_standard(metatensor_core) # Forzerà la modalità C++2c/26 abilitando i fold expression
 #install(TARGETS metatensor_core LIBRARY DESTINATION .)
 add_library(MetaTensorJIT
+        src/cpp/logds/tensormetadata/AntlrAstBuilderVisitor.cpp
         src/cpp/logds/tensormetadata/JitShapeInferenceEngine.cpp
         src/cpp/logds/tensormetadata/Mach7ShapeInferenceBridge.cpp
+        src/cpp/logds/tensormetadata/JitFlyweightDecorator.cpp
+        include/logds/tensormetadata/JitFlyweightDecorator.h
 )
+apply_maximum_cxx_standard(MetaTensorJIT)
 target_link_libraries(MetaTensorJIT )
