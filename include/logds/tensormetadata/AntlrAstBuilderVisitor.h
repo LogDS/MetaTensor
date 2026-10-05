@@ -83,8 +83,8 @@ public:
     // II. OPERATORI GRAFO COMPUTACOLO TENSORIALE (Downstream Decorator Bridges)
     // =============================================================================
     std::any visitMatMulExpr(TensorLangParser::MatMulExprContext *context) override {
-        auto L_dec = std::any_cast<TypingNodePtr>(context->expr(0)->accept(this));
-        auto R_dec = std::any_cast<TypingNodePtr>(context->expr(1)->accept(this));
+        auto L_dec = std::any_cast<TypingNodePtr>(visit(context->expr(0)));
+        auto R_dec = std::any_cast<TypingNodePtr>(visit(context->expr(1)));
 
         auto L_raw = std::static_pointer_cast<JitFlyweightDecorator>(L_dec)->get_intrinsic_type();
         auto R_raw = std::static_pointer_cast<JitFlyweightDecorator>(R_dec)->get_intrinsic_type();
@@ -173,7 +173,7 @@ public:
         for (auto* cfg : context->configDirective()) cfg->accept(this);
         std::vector<TypingNodePtr> bodies;
         for (auto* stmt : context->statement()) {
-            std::any res = stmt->accept(this);
+            std::any res = visit(stmt);
             if (res.has_value()) {
                 auto dec = std::any_cast<TypingNodePtr>(res);
                 bodies.push_back(std::static_pointer_cast<JitFlyweightDecorator>(dec)->get_intrinsic_type());

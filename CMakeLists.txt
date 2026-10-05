@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26) # scikit-build-core richiede almeno 3.15+, 3.26 garantisce la stabilità per nanobind e CUDA 13
-
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 # Opzione per attivare o disattivare il supporto distribuito (Disattivata di default)
 option(METATENSOR_USE_MPI "Build MetaTensor with multi-node MPI cluster support" OFF)
 add_compile_definitions(AT_PER_OPERATOR_HEADERS)
@@ -29,6 +29,7 @@ find_library(LIBGCCJIT_LIBRARY NAMES gccjit
         /usr/lib
 )
 
+add_subdirectory(submodules/antlr4/runtime/Cpp/)
 include_directories(submodules/antlr4/runtime/Cpp/runtime/src)
 include_directories(src/antlr4/)
 
@@ -139,6 +140,21 @@ add_library(MetaTensorJIT
         src/cpp/logds/tensormetadata/Mach7ShapeInferenceBridge.cpp
         src/cpp/logds/tensormetadata/JitFlyweightDecorator.cpp
         include/logds/tensormetadata/JitFlyweightDecorator.h
+        src/cpp/logds/libtorchwrapper/CreateMethod.cpp
+        include/logds/libtorchwrapper/CreateMethod.h
+        src/cpp/logds/libtorchwrapper/CreateLibTorchModule.cpp
+        include/logds/libtorchwrapper/CreateLibTorchModule.h
+        src/antlr4/TensorLangBaseListener.cpp
+        src/antlr4/TensorLangBaseVisitor.cpp
+        src/antlr4/TensorLangLexer.cpp
+        src/antlr4/TensorLangListener.cpp
+        src/antlr4/TensorLangParser.cpp
+        src/antlr4/TensorLangVisitor.cpp
 )
 apply_maximum_cxx_standard(MetaTensorJIT)
 target_link_libraries(MetaTensorJIT )
+target_link_libraries(MetaTensorJIT  "${TORCH_LIBRARIES}" antlr4_shared )
+
+add_executable(GirlCalledAlex make_module.cpp)
+apply_maximum_cxx_standard(GirlCalledAlex)
+target_link_libraries(GirlCalledAlex  "${TORCH_LIBRARIES}" antlr4_shared MetaTensorJIT)

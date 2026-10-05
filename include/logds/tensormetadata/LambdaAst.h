@@ -68,6 +68,8 @@ enum class FloatBinaryOp { ADD, SUB, DIV, MUL }; // +, -, /, *
 enum class FloatUnaryOp  { ABS };           // abs
 enum class FloatCompOp   { LT, GT, LE, GE, EQ, NE }; // <, >, <=, >=, ==, !=
 enum class IntrinsicPred { ISNAN, EPS, PLUS_INFINITY, MINUS_INFINITY };
+enum class LogicalBinOp  { AND, OR, XOR };
+enum class LogicalUnOp   { NOT };
 
 // Costanti intrinseche implicite agenti sulla cella
 struct IntrinsicPredicateNode : BooleanConditionNode {

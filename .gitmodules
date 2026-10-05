@@ -13,3 +13,6 @@
 [submodule "submodules/Mach7"]
 	path = submodules/Mach7
 	url = https://github.com/solodon4/Mach7/
+[submodule "submodules/pytorch"]
+	path = submodules/pytorch
+	url = https://github.com/pytorch/pytorch.git
