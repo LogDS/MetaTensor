@@ -1,8 +1,8 @@
 # MetaTensor (C++26 Edition)
 
-[![License: GPL v3](https://shields.io)](https://gnu.org)
-[![Language: C++26](https://shields.io)](https://cppreference.com)
-[![Backend: LibTorch / OpenXLA](https://shields.io)](https://pytorch.org)
+[![License: GPL v3](https://www.gnu.org/graphics/gplv3-with-text-136x68.png)](https://gnu.org)
+[![Language: C++26](https://img.shields.io/badge/C%2B%2B-00599C?style=flat&logo=c%2B%2B&logoColor=white)](https://cppreference.com)
+[![Backend: LibTorch / OpenXLA](https://miro.medium.com/v2/resize:fill:128:128/1*8AaAYxLb-VOgGUW8V8JXQA.png)](https://pytorch.org)
 
 **MetaTensor** is a strongly-typed, compile-time verified algebraic-relational tensor engine written in **C++26** and built on top of the bare-metal infrastructures of **OpenXLA (StableHLO)** and **LibTorch (ATen Core)**.
 
