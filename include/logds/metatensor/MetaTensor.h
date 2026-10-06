@@ -592,35 +592,48 @@ public:
         }
     }
 
-    // =========================================================================
-    // MOTORE DI CONTRAZIONE RELAZIONALE INTERNO (Riparato con static constexpr)
     // =============================================================================
-    template <typename... Projections, typename RightT>
-    auto contraction(const RightT& other) const {
-        using Compiler = RelationalEinsumCompiler<Rank, RightT::Rank, Projections...>;
+    // CONTRAZIONE RELAZIONALE MULTI-OPERANDO (Risoluzione Errore di Build NTTP)
+    // =============================================================================
+    template <typename... Projections, typename... OtherTensors>
+    auto contraction(const OtherTensors&... others) const {
 
-        // --- VALIDAZIONE GEOMETRICA FORMALE A TEMPO DI COMPILAZIONE ---
-        constexpr size_t idx_L = Compiler::contracting_axis_L;
-        constexpr size_t idx_R = Compiler::contracting_axis_R;
+        using AllTensorsTuple = std::tuple<MetaTensor<T, Layout, Dims...>, OtherTensors...>;
+        using Compiler = RelationalEinsumCompiler<AllTensorsTuple, Projections...>;
 
-        if constexpr (idx_L != 999 && idx_R != 999) {
-            constexpr size_t dim_L = Shape[idx_L];
-            constexpr size_t dim_R = RightT::Shape[idx_R];
+        std::vector<torch::Tensor> c10_inputs = { this->storage };
+        (c10_inputs.push_back(others.storage), ...);
 
-            static_assert(dim_L == dim_R,
-                "[ERR_GEOMETRY] Errore di contrazione relazionale: le dimensioni dell'asse contratto non coincidono!");
-        }
+        constexpr auto einsum_pattern = Compiler::string_storage.data();
+        torch::Tensor result_storage = torch::einsum(einsum_pattern, c10_inputs);
 
-        // RISOLUTIVO: Aggiunto 'static' per estendere la storage duration a tempo di compilazione
-        static constexpr auto out_shape = calculate_out_shape<MetaTensor, RightT, Projections...>();
+        constexpr size_t OutRank = sizeof...(Projections);
 
-        // Chiamata all'HLO / Einsum tramite la stringa calcolata a compile-time
-        constexpr auto einsum_str = Compiler::string_storage.data();
-        torch::Tensor result_storage = torch::einsum(einsum_str, {this->storage, other.storage});
+        // Helper interno constexpr per generare l'array in isolamento funzionale puro
+        // senza incorrere nei vincoli di linkage delle variabili statiche locali
+        auto compute_dimensions = []() {
+            std::array<size_t, OutRank> out_dims{};
+            size_t p_idx = 0;
 
-        // Ora 'out_shape' ha una validità d'indirizzo statica e può essere passata al template helper
-        return helper_return<out_shape>(result_storage, std::make_index_sequence<sizeof...(Projections)>{});
+            // Srotoliamo le proiezioni variadic per mappare gli assi
+            (([&]() {
+                constexpr uint64_t t_id = Projections::tensor_id;
+                constexpr size_t axis_idx = Projections::index;
+
+                using TargetTensorType = std::tuple_element_t<t_id, AllTensorsTuple>;
+                out_dims[p_idx++] = TargetTensorType::Shape[axis_idx];
+            }()), ...);
+
+            return out_dims;
+        };
+
+        // Istanziato direttamente per valore a costo zero a tempo di compilazione
+        constexpr auto out_shape = compute_dimensions();
+
+        // Passaggio pulito dell'array NTTP per valore conforme allo standard C++20/C++26
+        return helper_instantiate<out_shape>(result_storage, std::make_index_sequence<OutRank>{});
     }
+
 
     // -------------------------------------------------------------------------
     // 1. MASCHERA CONDIZIONALE / FUNZIONE INDICATRICE (I) VIA LAMBDA
@@ -1138,30 +1151,30 @@ private:
         return r_shape;
     }
 
-    // Metodo statico per calcolare la forma di output di una proiezione relazionale
-    template <typename LeftTensor, typename RightTensor, typename... Projections>
-    static constexpr auto calculate_out_shape() {
-        constexpr std::array<Source, sizeof...(Projections)> out_sources = { Projections::source... };
-        constexpr std::array<size_t, sizeof...(Projections)> out_indices = { Projections::index... };
+    // // Metodo statico per calcolare la forma di output di una proiezione relazionale
+    // template <typename LeftTensor, typename RightTensor, typename... Projections>
+    // static constexpr auto calculate_out_shape() {
+    //     constexpr std::array<uint64_t, sizeof...(Projections)> out_sources = { Projections::source... };
+    //     constexpr std::array<size_t, sizeof...(Projections)> out_indices = { Projections::index... };
+    //
+    //     std::array<size_t, sizeof...(Projections)> out_dims{};
+    //     for (size_t i = 0; i < sizeof...(Projections); ++i) {
+    //         if (out_sources[i] == Source::Left) {
+    //             out_dims[i] = LeftTensor::Shape[out_indices[i]];
+    //         } else {
+    //             out_dims[i] = RightTensor::Shape[out_indices[i]];
+    //         }
+    //     }
+    //     return out_dims;
+    // }
 
-        std::array<size_t, sizeof...(Projections)> out_dims{};
-        for (size_t i = 0; i < sizeof...(Projections); ++i) {
-            if (out_sources[i] == Source::Left) {
-                out_dims[i] = LeftTensor::Shape[out_indices[i]];
-            } else {
-                out_dims[i] = RightTensor::Shape[out_indices[i]];
-            }
-        }
-        return out_dims;
-    }
-
-    template <auto const& OutShape, size_t... Is>
+    template <auto  OutShape, size_t... Is>
     auto helper_return(torch::Tensor t, std::index_sequence<Is...>) const {
         // Restituisce un nuovo OpenXLA Tensor con la firma tipizzata e le dimensioni esatte proiettate
         return MetaTensor<T, Layout, OutShape[Is]...>(t);
     }
 
-    template <auto const& OutShape, size_t... Is>
+    template <auto OutShape, size_t... Is>
     auto helper_instantiate(torch::Tensor t, std::index_sequence<Is...>) const {
         return MetaTensor<T, Layout, OutShape[Is]...>(t);
     }

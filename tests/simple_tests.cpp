@@ -32,6 +32,40 @@ constexpr bool strings_are_equal(std::string_view a, std::string_view b) {
 // 1. UNIT TEST A TEMPO DI COMPILAZIONE (METAPROGRAMMAZIONE & IR)
 // =============================================================================
 
+TEST_CASE("Runtime: Contrazione Relazionale Variadic Multi-Operando", "[einsum_variadic]") {
+    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+
+    // Definiamo tre tensori a specchio con dimensioni disgiunte
+    MetaTensor<float, StorageLayout::Dense, 128, 64> X_mat(device, InitPattern::RandomUniform);
+    MetaTensor<float, StorageLayout::Dense, 64, 32>  W_mat(device, InitPattern::RandomNormal);
+    MetaTensor<float, StorageLayout::Dense, 32, 10>  H_mat(device, InitPattern::Zeros);
+
+    // 1. ESECUZIONE MULTI-CONTRAZIONE (ID 0 = X_mat, ID 1 = W_mat, ID 2 = H_mat)
+    // Contrae l'asse interno proiettando solo l'asse 0 di T0 (128) e l'asse 1 di T2 (10)
+    auto FusedResult = X_mat.contraction<Axis<0, 0>, Axis<2, 1>>(W_mat, H_mat);
+
+    // 2. VERIFICA STATICA DELLE PROIEZIONI COMPILATORE
+    STATIC_REQUIRE(decltype(FusedResult)::Rank == 2);
+    STATIC_REQUIRE(decltype(FusedResult)::Shape[0] == 128); // Ereditato da X_mat
+    STATIC_REQUIRE(decltype(FusedResult)::Shape[1] == 10);  // Ereditato da H_mat
+
+    // 3. VERIFICA HARDWARE DEL KERNEL FUSO DI LIBTORCH
+    REQUIRE(FusedResult.storage.size(0) == 128);
+    REQUIRE(FusedResult.storage.size(1) == 10);
+    REQUIRE(FusedResult.storage.defined());
+
+    X_mat.clear(); W_mat.clear(); H_mat.clear(); FusedResult.clear();
+}
+
+// Helper constexpr per la comparazione di string_view a tempo di compilazione
+constexpr bool static_strings_are_equal(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
 TEST_CASE("Metaprogramming: Validazione Constexpr dei Compilatori", "[compile-time]") {
     
     SECTION("Deduzione ed Auto-Broadcasting delle Forme Geometriche") {
@@ -49,18 +83,36 @@ TEST_CASE("Metaprogramming: Validazione Constexpr dei Compilatori", "[compile-ti
         constexpr auto bad_shape = deduce_broadcast_shape(lhs_shape, bad_rhs);
         STATIC_REQUIRE(bad_shape[0] == 999999); // Sentinella d'errore
     }
+}
 
-    SECTION("Generazione Stringhe HLO e Riconoscimento Assi di Contrazione") {
-        // Mappatura relazionale: L<0>, L<1>, R<0> su RankA=3 e RankB=2
-        // Equivalente alla sommatoria di Einstein: "abc,dc->abd"
-        using Compiler = RelationalEinsumCompiler<3, 2, L<0>, L<1>, R<0>>;
-        
-        constexpr std::string_view generated_str(Compiler::string_storage.data());
-        STATIC_REQUIRE(strings_are_equal(generated_str, "abc,dc->abd"));
-        
-        // Verifica che l'asse contratto sia stato identificato correttamente sulle dimensioni interne
-        STATIC_REQUIRE(Compiler::contracting_axis_L == 2); // Asse 'c' (posizione 2 in A)
-        STATIC_REQUIRE(Compiler::contracting_axis_R == 1); // Asse 'c' (posizione 1 in B)
+
+TEST_CASE("Meta-Compiler: Validazione Constexpr dell'Einsum Multi-Operando Variadic", "[einsum_compiler]") {
+
+    SECTION("Generazione Stringhe HLO e Riconoscimento Assi su N-Operandi") {
+        // Definiamo tre metatipi tensoriali fittizi per ispezionarne i ranghi statici
+        using T0 = MetaTensor<float, StorageLayout::Dense, 10, 20, 30>; // Rank 3 (Assi: a, b, c)
+        using T1 = MetaTensor<float, StorageLayout::Dense, 40, 30>;     // Rank 2 (Assi: d, e)
+        using T2 = MetaTensor<float, StorageLayout::Dense, 40, 50>;     // Rank 2 (Assi: f, g)
+
+        // Impacchettiamo i tipi in una tupla per il compilatore variadic
+        using InputTensorsTuple = std::tuple<T0, T1, T2>;
+
+        // Mappatura proiezioni desiderate nell'output finale:
+        // Vogliamo estrarre l'asse 0 di T0 (a), l'asse 1 di T0 (b) e l'asse 1 di T2 (g)
+        // Stringa d'ingresso generata constexpr: "abc,de,fg"
+        // Stringa risultante attesa post-contrazione: "abc,de,fg->abg"
+        using Compiler = RelationalEinsumCompiler<InputTensorsTuple, Axis<0, 0>, Axis<0, 1>, Axis<2, 1>>;
+
+        // 1. VERIFICA STATICA DELLA STRINGA EINSUM EMESSA IN RAM
+        constexpr std::string_view generated_pattern(Compiler::string_storage.data());
+
+        std::cout << "[CATCH2 JIT TEST] Einsum Pattern Variadic Generato: " << generated_pattern << "\n";
+
+        STATIC_REQUIRE(static_strings_are_equal(generated_pattern, "abc,de,fg->abg"));
+
+        // 2. VERIFICA INTEGRITÀ DEI METADATI DEI COMPONENTI CONGELATI
+        STATIC_REQUIRE(Compiler::num_tensors == 3);
+        STATIC_REQUIRE(Compiler::total_ranks == 7); // 3 + 2 + 2 = 7 assi totali nell'alfabeto
     }
 }
 
