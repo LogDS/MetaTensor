@@ -96,7 +96,8 @@ std::shared_ptr<torch::jit::Graph> create_parametrizable_optimizer_subgraph(
     torch::jit::Value* v_in       = g->addInput("v_in");         // Tensor[]
     torch::jit::Value* loop_iter  = g->addInput("loop_iter");    // int (Scalar)
 
-    auto tensor_list_type = c10::ListType::create(c10::TensorType::get());
+    auto tensor_type = c10::TensorType::get();
+    auto tensor_list_type = c10::ListType::ofTensors();
     weights_in->setType(tensor_list_type);
     grads_in->setType(tensor_list_type);
     m_in->setType(tensor_list_type);
@@ -105,7 +106,7 @@ std::shared_ptr<torch::jit::Graph> create_parametrizable_optimizer_subgraph(
     loop_iter->setType(c10::IntType::get());
 
     torch::jit::Value* alpha_one = g->insertConstant(1.0);
-    auto tensor_type = c10::TensorType::get();
+
 
     std::vector<torch::jit::Value*> updated_weights;
     std::vector<torch::jit::Value*> updated_m;
@@ -160,26 +161,31 @@ std::shared_ptr<torch::jit::Graph> create_parametrizable_optimizer_subgraph(
             torch::jit::Value* eps = g->insertConstant(1e-8);
 
             torch::jit::Node* m_nx = g->create(torch::jit::aten::lerp, {g_i->output(), m_i->output(), b1});
-            g->insertNode(m_nx);
             next_m = m_nx->output();
+            next_m->setType(tensor_type);
+            g->insertNode(m_nx);
 
             torch::jit::Node* grad_sq = g->create(torch::jit::aten::mul, {g_i->output(), g_i->output()});
             g->insertNode(grad_sq);
             torch::jit::Node* v_nx = g->create(torch::jit::aten::lerp, {grad_sq->output(), v_i->output(), b2});
             g->insertNode(v_nx);
             next_v = v_nx->output();
+            next_v->setType(tensor_type);
 
             torch::jit::Node* sq_v = g->create(torch::jit::aten::sqrt, {next_v});
             g->insertNode(sq_v);
             torch::jit::Node* den = g->create(torch::jit::aten::add, {sq_v->output(), eps, alpha_one});
             g->insertNode(den);
             torch::jit::Node* stp = g->create(torch::jit::aten::div, {next_m, den->output()});
+            stp->output()->setType(c10::TensorType::get());
             g->insertNode(stp);
             torch::jit::Node* lr_stp = g->create(torch::jit::aten::mul, {stp->output(), lr_in});
             g->insertNode(lr_stp);
             torch::jit::Node* upd = g->create(torch::jit::aten::sub, {w_i->output(), lr_stp->output(), alpha_one});
-            g->insertNode(upd);
+            upd->output()->setType(c10::TensorType::get());
             next_w = upd->output();
+            next_w->setType(tensor_type);
+            g->insertNode(upd);
         }
 
         updated_weights.push_back(next_w);
@@ -190,7 +196,12 @@ std::shared_ptr<torch::jit::Graph> create_parametrizable_optimizer_subgraph(
     torch::jit::Node* next_weights_list = g->create(torch::jit::prim::ListConstruct, updated_weights);
     torch::jit::Node* next_m_list       = g->create(torch::jit::prim::ListConstruct, updated_m);
     torch::jit::Node* next_v_list       = g->create(torch::jit::prim::ListConstruct, updated_v);
-    g->insertNode(next_weights_list); g->insertNode(next_m_list); g->insertNode(next_v_list);
+    next_weights_list->output()->setType(tensor_list_type);
+    next_m_list->output()->setType(tensor_list_type);
+    next_v_list->output()->setType(tensor_list_type);
+    g->insertNode(next_weights_list);
+    g->insertNode(next_m_list);
+    g->insertNode(next_v_list);
 
     // =========================================================================
     // 3. LOGICA DI DECAY DEL LEARNING RATE
@@ -230,6 +241,7 @@ std::shared_ptr<torch::jit::Graph> create_parametrizable_optimizer_subgraph(
         }
 
         next_lr = if_node->output();
+        next_lr->setType(c10::FloatType::get());
     }
 
     // =========================================================================

@@ -102,8 +102,61 @@ std::shared_ptr<torch::jit::Graph> create_user_loss_and_stopping_subgraph() {
     return u_graph;
 }
 
+int driver_create_parametrizable_optimizer_subgraph(void) {
+    torch::jit::Module module_{"create_parametrizable_optimizer_subgraph"};
+    auto graph = create_parametrizable_optimizer_subgraph(3, OptimizerType::Adam, DecayType::Exponential, 0.03, 100);
 
-int main(void) {
+    // 1. CRITICAL: Inject a "self" node at the absolute start of your input list (Index 0)
+    // LibTorch methods require this so the serialization logic knows what module it belongs to.
+    torch::jit::Value* self_val = graph->insertInput(0, "self");
+    self_val->setType(module_._ivalue()->type()); // Bind it to this specific module instance type
+
+    c10::QualifiedName method_name(*module_.type()->name(), "forward");
+
+    /*    torch::jit::Value* weights_in = g->addInput("weights_in");   // Tensor[]
+    torch::jit::Value* grads_in   = g->addInput("grads_in");     // Tensor[]
+    torch::jit::Value* lr_in      = g->addInput("lr_in");        // float (Scalar)
+    torch::jit::Value* m_in       = g->addInput("m_in");         // Tensor[]
+    torch::jit::Value* v_in       = g->addInput("v_in");         // Tensor[]
+    torch::jit::Value* loop_iter  = g->addInput("loop_iter");    // int (Scalar)*/
+
+    auto tensor_type = c10::TensorType::get();
+    auto tensor_list_type = c10::ListType::create(tensor_type);
+    auto int_type = c10::IntType::get();
+    auto bool_type = c10::BoolType::get();
+    auto float_type = c10::FloatType::get();
+    std::vector<c10::Argument> arguments = {
+        c10::Argument("self", module_.type()),
+        c10::Argument("weights_in", tensor_list_type),
+        c10::Argument("grads_in", tensor_list_type),
+        c10::Argument("lr_in", float_type),
+        c10::Argument("m_in", tensor_list_type),
+        c10::Argument("v_in", tensor_list_type),
+        c10::Argument("loop_iter", int_type)
+    };
+
+    // 4. Construct the return signature tuple
+    auto tuple_return_type = c10::TupleType::create({tensor_list_type, float_type, tensor_list_type, tensor_list_type});
+    std::vector<c10::Argument> returns = {
+        c10::Argument("", tuple_return_type)
+    };
+
+    c10::FunctionSchema schema(method_name.name(), "", arguments, returns);
+
+    auto method = module_._ivalue()->compilation_unit()->create_function(method_name, graph);
+
+    // 7. Apply the schema directly to the compiled method
+    method->setSchema(std::move(schema));
+
+    // 8. Bind the configured method down to the module runtime layer
+    module_.type()->addMethod(method);
+
+    // This will now execute and output your serialized model file safely
+    module_.save("create_parametrizable_optimizer_subgraph.pt");
+    return 0;
+}
+
+int driver_create_parametrizable_optimizer_subgraph(void) {
     torch::jit::Module module_{"create_user_loss_and_stopping_subgraph"};
     auto graph = create_user_loss_and_stopping_subgraph();
 
