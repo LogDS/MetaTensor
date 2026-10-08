@@ -5,7 +5,8 @@ option(METATENSOR_USE_MPI "Build MetaTensor with multi-node MPI cluster support"
 add_compile_definitions(AT_PER_OPERATOR_HEADERS)
 add_compile_definitions(CAFFE2_USE_GOOGLE_GLOG)
 set(CMAKE_CXX_EXTENSIONS ON) # Abilita gnu++ rispetto a c++ puro, risolve i conflitti di typeid.h
-
+set(BUILD_LIBTORCH_CPU_WITH_DEBUG ON)
+set(BUILD_TEST OFF)
 
 if(METATENSOR_USE_MPI)
     # Se attivata dall'utente, iniettiamo la macro di compilazione globale
@@ -30,6 +31,7 @@ find_library(LIBGCCJIT_LIBRARY NAMES gccjit
 )
 
 add_subdirectory(submodules/antlr4/runtime/Cpp/)
+#add_subdirectory(submodules/pytorch)
 include_directories(submodules/antlr4/runtime/Cpp/runtime/src)
 include_directories(src/antlr4/)
 
@@ -150,6 +152,8 @@ add_library(MetaTensorJIT
         src/antlr4/TensorLangListener.cpp
         src/antlr4/TensorLangParser.cpp
         src/antlr4/TensorLangVisitor.cpp
+        src/cpp/logds/libtorchwrapper/general_training_framework.cpp
+        include/logds/libtorchwrapper/general_training_framework.h
 )
 apply_maximum_cxx_standard(MetaTensorJIT)
 target_link_libraries(MetaTensorJIT )
@@ -158,3 +162,7 @@ target_link_libraries(MetaTensorJIT  "${TORCH_LIBRARIES}" antlr4_shared )
 add_executable(GirlCalledAlex make_module.cpp)
 apply_maximum_cxx_standard(GirlCalledAlex)
 target_link_libraries(GirlCalledAlex  "${TORCH_LIBRARIES}" antlr4_shared MetaTensorJIT)
+
+add_executable(pre_compiler examples/pre_compiler_example.cpp)
+apply_maximum_cxx_standard(pre_compiler)
+target_link_libraries(pre_compiler  antlr4_shared MetaTensorJIT)

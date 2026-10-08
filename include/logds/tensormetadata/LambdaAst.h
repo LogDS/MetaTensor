@@ -64,12 +64,14 @@ struct FloatValueLiteralNode : FloatExpressionNode {
 // =============================================================================
 // ENUMERAZIONI OPERAZIONALI E COSTANTI INTRESECCHE IMPLICITE
 // =============================================================================
-enum class FloatBinaryOp { ADD, SUB, DIV, MUL }; // +, -, /, *
-enum class FloatUnaryOp  { ABS };           // abs
-enum class FloatCompOp   { LT, GT, LE, GE, EQ, NE }; // <, >, <=, >=, ==, !=
-enum class IntrinsicPred { ISNAN, EPS, PLUS_INFINITY, MINUS_INFINITY };
-enum class LogicalBinOp  { AND, OR, XOR };
-enum class LogicalUnOp   { NOT };
+enum class FloatBinaryOp        { ADD, SUB, DIV, MUL }; // +, -, /, *
+enum class FloatUnaryOp         { ABS };           // abs
+enum class FloatCompOp          { LT, GT, LE, GE, EQ, NE }; // <, >, <=, >=, ==, !=
+enum class IntrinsicPred        { ISNAN, EPS, PLUS_INFINITY, MINUS_INFINITY };
+enum class LogicalBinOp         { AND, OR, XOR };
+enum class LogicalUnOp          { NOT };
+enum class TensorAggregation    { ALL, ANY, ALL_SUM };
+enum class BinaryTensorOp       { MM_2DMatrixMult, MatMul, Cross, ADD, ElementWise_MUL };
 
 // Costanti intrinseche implicite agenti sulla cella
 struct IntrinsicPredicateNode : BooleanConditionNode {

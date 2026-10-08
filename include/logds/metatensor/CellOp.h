@@ -25,6 +25,8 @@ enum class CellOp {
     Exp,
     Exp2,
     Log,
+    Log2,
+    Log10,
     Tanh,
     Abs,
     Sqrt,
