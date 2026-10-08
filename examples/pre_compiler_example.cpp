@@ -21,7 +21,7 @@ std::shared_ptr<torch::jit::Graph> create_user_loss_and_stopping_subgraph() {
 
     // 1. Define the abstract JIT Types we need
     // auto tensor_type = c10::TensorType::get();               // The Type representing a Tensor
-    auto tensor_list_type = c10::ListType::create(tensor_type); // The Type representing List[Tensor]
+    auto tensor_list_type = c10::ListType::ofTensors(); // The Type representing List[Tensor]
 
     // 2. Add inputs (LibTorch defaults them all to TensorType)
     torch::jit::Value* u_weights = u_graph->addInput("weights");
@@ -33,7 +33,6 @@ std::shared_ptr<torch::jit::Graph> create_user_loss_and_stopping_subgraph() {
     // 3. CRITICAL: Override the default Tensor types with correct static list types
     u_inputs_list->setType(tensor_list_type);
     u_targets_list->setType(tensor_list_type);
-
     // If 'weights' is a List[Tensor] as well, set its type:
     u_weights->setType(tensor_list_type);
     // If 'weights' is just a big 2D Tensor, keep it as is, but change line 33
@@ -49,21 +48,23 @@ std::shared_ptr<torch::jit::Graph> create_user_loss_and_stopping_subgraph() {
 
     torch::jit::Value* num_batches = u_graph->insertConstant(2);
     torch::jit::Node* batch_idx = u_graph->create(torch::jit::aten::remainder, {u_loop_iter, num_batches});
+    auto val = batch_idx->output();
+    val->setType(c10::IntType::get());
     u_graph->insertNode(batch_idx);
 
     c10::Symbol get_item_op = c10::Symbol::fromQualString("aten::__getitem__");
-    torch::jit::Node* input_batch = u_graph->create(get_item_op, {u_inputs_list, batch_idx->output()});
-    torch::jit::Node* target_batch = u_graph->create(get_item_op, {u_targets_list, batch_idx->output()});
-    u_graph->insertNode(input_batch);
-    u_graph->insertNode(target_batch);
-
+    torch::jit::Node* input_batch = u_graph->create(get_item_op, {u_inputs_list, val});
+    torch::jit::Node* target_batch = u_graph->create(get_item_op, {u_targets_list, val});
     // Explicitly type the outputs of getitem so subsequent nodes (like matmul) pass validation
     input_batch->output()->setType(tensor_type);
     target_batch->output()->setType(tensor_type);
+    u_graph->insertNode(input_batch);
+    u_graph->insertNode(target_batch);
 
-    torch::jit::Node* w0 = u_graph->create(get_item_op, {u_weights, u_graph->insertConstant(0)});
-    u_graph->insertNode(w0);
+    torch::jit::Node* w0 = u_graph->create(get_item_op, {u_weights, u_graph->insertConstant(0)->setType(c10::IntType::get())});
     w0->output()->setType(tensor_type);
+    u_graph->insertNode(w0);
+
 
     torch::jit::Node* pred = u_graph->create(torch::jit::aten::matmul, {input_batch->output(), w0->output()});
     u_graph->insertNode(pred);
@@ -102,7 +103,7 @@ std::shared_ptr<torch::jit::Graph> create_user_loss_and_stopping_subgraph() {
 }
 
 
-int compile_create_user_loss_and_stopping_subgraph(void) {
+int main(void) {
     torch::jit::Module module_{"create_user_loss_and_stopping_subgraph"};
     auto graph = create_user_loss_and_stopping_subgraph();
 
@@ -149,6 +150,7 @@ int compile_create_user_loss_and_stopping_subgraph(void) {
 
     // This will now execute and output your serialized model file safely
     module_.save("create_user_loss_and_stopping_subgraph.pt");
+    return 0;
 }
 
 
