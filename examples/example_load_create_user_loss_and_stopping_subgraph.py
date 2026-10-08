@@ -1,3 +1,7 @@
+"""
+This script has to be seen as an example showing how to use the result from create_user_loss_and_stopping_subgraph.
+In particular, the resulting module being loaded here is the one being compiled through/via compile_create_user_loss_and_stopping_subgraph
+"""
 import torch
 
 # 1. Load the compiled LibTorch JIT module

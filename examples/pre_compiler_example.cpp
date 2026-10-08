@@ -5,6 +5,11 @@
 #include <torch/torch.h>
 #include <logds/libtorchwrapper/general_training_framework.h>
 
+/**
+ * An example of a subgraph which is providing the major computation force
+ *
+ * @return The compiled subgraph which is mimicking the loop iteration function.
+ */
 std::shared_ptr<torch::jit::Graph> create_user_loss_and_stopping_subgraph() {
     auto u_graph = std::make_shared<torch::jit::Graph>();
     // Creazione del TupleType puro (senza nome o label di chiavi).
@@ -97,9 +102,7 @@ std::shared_ptr<torch::jit::Graph> create_user_loss_and_stopping_subgraph() {
 }
 
 
-int main(void) {
-
-
+int compile_create_user_loss_and_stopping_subgraph(void) {
     torch::jit::Module module_{"create_user_loss_and_stopping_subgraph"};
     auto graph = create_user_loss_and_stopping_subgraph();
 
