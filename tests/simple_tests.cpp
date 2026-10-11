@@ -640,3 +640,88 @@ TEST_CASE("Runtime: Caricamento Universale Arbitrario con Polimorfismo Dinamico"
 
     std::remove(safe_path.c_str());
 }
+
+
+/*
+ * This file is part of the MetaTensor distribution (https://github.com).
+ * Copyright (c) 2026 Giacomo Bergami, PhD
+ */
+
+#include <catch2/catch_test_macros.hpp>
+#include <logds/metatensor/MetaTensor.h>
+
+TEST_CASE("Runtime: Validazione Gather ND Generalizzato Multidimensionale (Riparato)", "[gather_nd_generic]") {
+    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+
+    SECTION("Caso A: Estrazione Atomica (Sorgente 3D, Indice 2D -> Output 1D)") {
+        MetaTensor<float, StorageLayout::Dense, 10, 20, 30> source_3d(device, InitPattern::RandomUniform);
+        MetaTensor<float, StorageLayout::Dense, 5, 3> indices_2d(device, InitPattern::Zeros);
+
+        auto Result = source_3d.gather_nd(indices_2d);
+
+        // VERIFICA CORRETTA DEGLI ASSI STATICI TRAMITE CORREZIONE SHAPE[i]
+        STATIC_REQUIRE(decltype(Result)::Rank == 1);
+        STATIC_REQUIRE(decltype(Result)::Shape[0] == 5);
+
+        REQUIRE(Result.storage.size(0) == 5);
+        Result.clear(); source_3d.clear(); indices_2d.clear();
+    }
+
+    SECTION("Caso B: Estrazione di Slices (Sorgente 3D, Indice 2D con K Parziale -> Output 3D)") {
+        MetaTensor<float, StorageLayout::Dense, 10, 20, 30> source_3d(device, InitPattern::RandomUniform);
+        MetaTensor<float, StorageLayout::Dense, 5, 1> indices_partial(device, InitPattern::Zeros);
+
+        auto ResultSlice = source_3d.gather_nd(indices_partial);
+
+        // VERIFICA CORRETTA DEGLI ASSI STATICI TRIDIMENSIONALI TRAMITE SHAPE[i]
+        STATIC_REQUIRE(decltype(ResultSlice)::Rank == 3);
+        STATIC_REQUIRE(decltype(ResultSlice)::Shape[0] == 5);   // Asse dell'indice J_0
+        STATIC_REQUIRE(decltype(ResultSlice)::Shape[1] == 20);  // Asse residuo sorgente 1
+        STATIC_REQUIRE(decltype(ResultSlice)::Shape[2] == 30);  // Asse residuo sorgente 2
+
+        REQUIRE(ResultSlice.storage.size(0) == 5);
+        REQUIRE(ResultSlice.storage.size(1) == 20);
+        REQUIRE(ResultSlice.storage.size(2) == 30);
+
+        ResultSlice.clear(); source_3d.clear(); indices_partial.clear();
+    }
+}
+
+TEST_CASE("Runtime: Validazione Reshape e Stack Strongly-Typed", "[reshape_stack]") {
+    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+
+    SECTION("Validazione Reshape (Bypass Volume Control)") {
+        MetaTensor<float, StorageLayout::Dense, 4, 4> matrix(device, InitPattern::RandomNormal);
+
+        // Uniamo gli assi: 4x4 (Volume 16) -> 2x8 (Volume 16)
+        auto Flattened = matrix.template reshape<2, 8>();
+
+        STATIC_REQUIRE(decltype(Flattened)::Rank == 2);
+        STATIC_REQUIRE(decltype(Flattened)::Shape[0] == 2);
+        STATIC_REQUIRE(decltype(Flattened)::Shape[1] == 8);
+        REQUIRE(Flattened.storage.size(0) == 2);
+        REQUIRE(Flattened.storage.size(1) == 8);
+
+        matrix.clear(); Flattened.clear();
+    }
+
+    SECTION("Validazione Stack (Variadic Axis Concatenation)") {
+        MetaTensor<float, StorageLayout::Dense, 3, 5> t0(device, InitPattern::Zeros);
+        MetaTensor<float, StorageLayout::Dense, 3, 5> t1(device, InitPattern::Zeros);
+        MetaTensor<float, StorageLayout::Dense, 3, 5> t2(device, InitPattern::Zeros);
+
+        // Concateniamo 3 tensori lungo l'asse iniziale 0 -> Nuovo asse inserito alla posizione 0
+        auto Stacked = t0.template stack<0>(t1, t2);
+
+        STATIC_REQUIRE(decltype(Stacked)::Rank == 3);
+        STATIC_REQUIRE(decltype(Stacked)::Shape[0] == 3); // Numero di tensori inseriti nel nastro dello stack
+        STATIC_REQUIRE(decltype(Stacked)::Shape[1] == 3); // Vecchio asse 0
+        STATIC_REQUIRE(decltype(Stacked)::Shape[2] == 5); // Vecchio asse 1
+
+        REQUIRE(Stacked.storage.size(0) == 3);
+        REQUIRE(Stacked.storage.size(1) == 3);
+        REQUIRE(Stacked.storage.size(2) == 5);
+
+        t0.clear(); t1.clear(); t2.clear(); Stacked.clear();
+    }
+}

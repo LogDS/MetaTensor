@@ -34,6 +34,7 @@ add_subdirectory(submodules/antlr4/runtime/Cpp/)
 #add_subdirectory(submodules/pytorch)
 include_directories(submodules/antlr4/runtime/Cpp/runtime/src)
 include_directories(src/antlr4/)
+include_directories(submodules/rva/include)
 
 # Gestisce i messaggi di errore se la libreria non viene trovata
 include(FindPackageHandleStandardArgs)
@@ -163,6 +164,6 @@ add_executable(GirlCalledAlex make_module.cpp)
 apply_maximum_cxx_standard(GirlCalledAlex)
 target_link_libraries(GirlCalledAlex  "${TORCH_LIBRARIES}" antlr4_shared MetaTensorJIT)
 
-add_executable(pre_compiler examples/pre_compiler_example.cpp)
+add_executable(pre_compiler examples/pre_compiler_example.cpp include/logds/language/MetaTensorLanguage.h)
 apply_maximum_cxx_standard(pre_compiler)
 target_link_libraries(pre_compiler  antlr4_shared MetaTensorJIT)

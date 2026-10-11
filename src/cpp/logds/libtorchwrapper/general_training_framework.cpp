@@ -56,8 +56,8 @@ torch::jit::Value* createTupleResult(torch::jit::Graph* graph,
 }
 
 std::vector<torch::jit::Value*> extractTupleResult(torch::jit::Value* combined_tuple_out,
-                                            torch::jit::Graph* master_graph,
-                                            uint64_t expected_size,
+                                                   torch::jit::Graph* master_graph,
+                                                   uint64_t expected_size,
     const std::vector<c10::TypePtr>& expected_types) {
     // Assume 'master_graph' is your outer block, and 'call_node' is a prim::CallGraph node
     std::vector<torch::jit::Value*> result;
@@ -251,170 +251,189 @@ std::shared_ptr<torch::jit::Graph> create_parametrizable_optimizer_subgraph(
     return g;
 }
 
-void build_universal_training_pipeline(
-    std::shared_ptr<torch::jit::Graph>& main_graph,
-    const std::vector<torch::jit::Value*>& dataset_inputs_vector,
-    const std::vector<torch::jit::Value*>& dataset_targets_vector,
-    const std::vector<torch::jit::Value*>& initial_weights,
+
+#include "logds/libtorchwrapper/general_training_framework.h"
+#include <torch/script.h>
+#include <torch/csrc/jit/ir/ir.h>
+#include <torch/csrc/jit/passes/inliner.h>
+#include <vector>
+#include <memory>
+
+// (Mantieni qui le tue definizioni corrette di createTupleResult ed extractTupleResult)
+#include "logds/libtorchwrapper/general_training_framework.h"
+#include <torch/script.h>
+#include <torch/csrc/jit/ir/ir.h>
+#include <torch/csrc/jit/passes/inliner.h>
+#include <vector>
+#include <memory>
+#include "logds/libtorchwrapper/general_training_framework.h"
+#include <torch/script.h>
+#include <torch/csrc/jit/ir/ir.h>
+#include <torch/csrc/jit/passes/inliner.h>
+#include <vector>
+#include <memory>
+std::shared_ptr<torch::jit::Graph> build_universal_training_pipeline(
     std::shared_ptr<torch::jit::Graph> user_step_subgraph,
     std::shared_ptr<torch::jit::Graph> optimizer_subgraph,
+    size_t num_tensors,
     int max_epochs,
     float initial_lr
 ) {
-    // 1. Inizializzazione delle costanti esterne al ciclo
-    torch::jit::Value* max_epochs_val = main_graph->insertConstant(max_epochs);
-    torch::jit::Value* cond_true = main_graph->insertConstant(true);
-    torch::jit::Value* lr_init_val = main_graph->insertConstant(initial_lr);
-    torch::jit::Value* none_val = main_graph->insertConstant(c10::nullopt);
+    auto main_graph = std::make_shared<torch::jit::Graph>();
 
-    // Impacchettamento dei vettori di dataset in Liste JIT native (Tensor[])
-    torch::jit::Node* inputs_list_node = main_graph->create(torch::jit::prim::ListConstruct, dataset_inputs_vector);
-    torch::jit::Node* targets_list_node = main_graph->create(torch::jit::prim::ListConstruct, dataset_targets_vector);
-    main_graph->insertNode(inputs_list_node);
-    main_graph->insertNode(targets_list_node);
+    // 1. Configurazione Canali di Ingresso Radice
+    torch::jit::Value* in_dataset_inputs  = main_graph->addInput("dataset_inputs");
+    torch::jit::Value* in_dataset_targets = main_graph->addInput("dataset_targets");
+    torch::jit::Value* in_initial_weights = main_graph->addInput("initial_weights");
 
-    torch::jit::Value* dataset_inputs_list = inputs_list_node->output();
-    torch::jit::Value* dataset_targets_list = targets_list_node->output();
+    auto tensor_list_type = c10::ListType::ofTensors();
+    in_dataset_inputs->setType(tensor_list_type);
+    in_dataset_targets->setType(tensor_list_type);
+    in_initial_weights->setType(tensor_list_type);
 
-    // Impacchettamento iniziale dei parametri globali da ottimizzare
-    torch::jit::Node* w_list_node = main_graph->create(torch::jit::prim::ListConstruct, initial_weights);
-    main_graph->insertNode(w_list_node);
-    torch::jit::Value* initial_weights_list = w_list_node->output();
+    // Costanti e configurazioni strutturali
+    torch::jit::Value* loop_limit_huge = main_graph->insertConstant(static_cast<int64_t>(9223372036854775807));
+    torch::jit::Value* cond_true       = main_graph->insertConstant(true);
+    torch::jit::Value* max_epochs_val  = main_graph->insertConstant(static_cast<int64_t>(max_epochs));
+    torch::jit::Value* epoch_start_val = main_graph->insertConstant(static_cast<int64_t>(0));
+    torch::jit::Value* lr_init_val     = main_graph->insertConstant(initial_lr);
+    torch::jit::Value* none_val        = main_graph->insertConstant(c10::nullopt);
+    torch::jit::Value* int_one         = main_graph->insertConstant(static_cast<int64_t>(1));
 
-    // Allocazione degli stati dell'ottimizzatore (M1, M2) come liste di zeri
-    std::vector<torch::jit::Value*> zero_tensors;
-    for (auto* w : initial_weights) {
-        torch::jit::Node* z = main_graph->create(torch::jit::aten::zeros_like, {w, none_val, none_val, none_val, none_val, none_val});
-        main_graph->insertNode(z);
-        zero_tensors.push_back(z->output());
+    // Allocazione stati ottimizzatore (m_list, v_list) tramite unrolling
+    std::vector<torch::jit::Value*> zero_m_elements;
+    std::vector<torch::jit::Value*> zero_v_elements;
+    for (size_t i = 0; i < num_tensors; ++i) {
+        torch::jit::Value* idx = main_graph->insertConstant(static_cast<int64_t>(i));
+        torch::jit::Node* w_i = main_graph->create(torch::jit::aten::select, {in_initial_weights, idx});
+        main_graph->insertNode(w_i);
+        w_i->output()->setType(c10::TensorType::get());
+
+        torch::jit::Node* z_m = main_graph->create(torch::jit::aten::zeros_like, {w_i->output(), none_val, none_val, none_val, none_val, none_val});
+        torch::jit::Node* z_v = main_graph->create(torch::jit::aten::zeros_like, {w_i->output(), none_val, none_val, none_val, none_val, none_val});
+        main_graph->insertNode(z_m); main_graph->insertNode(z_v);
+
+        zero_m_elements.push_back(z_m->output());
+        zero_v_elements.push_back(z_v->output());
     }
+    torch::jit::Value* init_m = main_graph->create(torch::jit::prim::ListConstruct, zero_m_elements)->output();
+    torch::jit::Value* init_v = main_graph->create(torch::jit::prim::ListConstruct, zero_v_elements)->output();
+    main_graph->insertNode(main_graph->create(torch::jit::prim::ListConstruct, zero_m_elements));
+    main_graph->insertNode(main_graph->create(torch::jit::prim::ListConstruct, zero_v_elements));
+    init_m->setType(tensor_list_type); init_v->setType(tensor_list_type);
 
-    torch::jit::Node* m_list_node = main_graph->create(torch::jit::prim::ListConstruct, zero_tensors);
-    torch::jit::Node* v_list_node = main_graph->create(torch::jit::prim::ListConstruct, zero_tensors);
-    main_graph->insertNode(m_list_node);
-    main_graph->insertNode(v_list_node);
+    // =========================================================================
+    // ACCORPAMENTO IN TUPLE DEGLI STATI (Soddisfa la regola dei 5 parametri)
+    // =========================================================================
+    // Stato 2 (Ottimizzatore): Conterrà [m_list, v_list]
+    torch::jit::Node* opt_state_tuple = main_graph->create(torch::jit::prim::TupleConstruct, {init_m, init_v});
+    main_graph->insertNode(opt_state_tuple);
 
-    torch::jit::Value* init_m = m_list_node->output();
-    torch::jit::Value* init_v = v_list_node->output();
+    // Stato 3 (Iperparametri): Conterrà [lr, epoch_iter]
+    torch::jit::Node* hyper_state_tuple = main_graph->create(torch::jit::prim::TupleConstruct, {lr_init_val, epoch_start_val});
+    main_graph->insertNode(hyper_state_tuple);
 
-    // 2. Registrazione delle Loop-Carried Variables in ingresso a prim::Loop
+    // 2. Istanziazione prim::Loop rigorosamente con 5 parametri
     std::vector<torch::jit::Value*> loop_inputs = {
-        max_epochs_val, cond_true, initial_weights_list, lr_init_val, init_m, init_v
+        loop_limit_huge, cond_true, in_initial_weights, opt_state_tuple->output(), hyper_state_tuple->output()
     };
     torch::jit::Node* loop_node = main_graph->create(torch::jit::prim::Loop, loop_inputs);
     main_graph->insertNode(loop_node);
 
-    // 3. Configurazione del Blocco Interno del Ciclo (Corpo del Loop)
+    // Configurazione del Blocco (Accetta rigorosamente 4 ingressi strutturali)
     torch::jit::Block* body = loop_node->addBlock();
-    torch::jit::Value* loop_iter    = body->addInput("iter");
-    torch::jit::Value* loop_cond_in = body->addInput("cond_in");
-    torch::jit::Value* b_weights    = body->addInput("weights_list");
-    torch::jit::Value* b_lr         = body->addInput("lr");
-    torch::jit::Value* b_m_list     = body->addInput("m_list");
-    torch::jit::Value* b_v_list     = body->addInput("v_list");
+    torch::jit::Value* loop_index_jit = body->addInput("loop_index_jit"); // Slot 0
+    torch::jit::Value* loop_cond_in   = body->addInput("cond_in");        // Slot 1
+    torch::jit::Value* b_weights      = body->addInput("weights_list");   // Slot 2 (Tensor[])
+    torch::jit::Value* b_opt_tuple    = body->addInput("opt_tuple");      // Slot 3 (Tuple)
+    torch::jit::Value* b_hyper_tuple  = body->addInput("hyper_tuple");    // Slot 4 (Tuple)
 
-    // CORREZIONE FONDAMENTALE: Impostiamo l'insert point direttamente all'interno del blocco body.
-    // Usiamo il blocco per forzare il corretto accoppiamento sequenziale.
+    loop_index_jit->setType(c10::IntType::get());
+    loop_cond_in->setType(c10::BoolType::get());
+    b_weights->setType(tensor_list_type);
+
     torch::jit::WithInsertPoint insert_point(body);
 
+    // Spacchettamento delle Tuple all'ingresso del ciclo per alimentare i sottografi
+    std::vector<c10::TypePtr> opt_types = { tensor_list_type, tensor_list_type };
+    auto opt_unpacked = extractTupleResult(b_opt_tuple, main_graph.get(), 2, opt_types);
+    torch::jit::Value* b_m_list = opt_unpacked[0];
+    torch::jit::Value* b_v_list = opt_unpacked[1];
+
+    std::vector<c10::TypePtr> hyper_types = { c10::FloatType::get(), c10::IntType::get() };
+    auto hyper_unpacked = extractTupleResult(b_hyper_tuple, main_graph.get(), 2, hyper_types);
+    torch::jit::Value* b_lr         = hyper_unpacked[0];
+    torch::jit::Value* b_epoch_iter = hyper_unpacked[1];
+
     // =========================================================================
-    // PASSO 1: INNESTO DEL SOTTOGRAFO DELL'UTENTE (All'interno di body)
+    // INNESTO DEI SOTTOGRAFI (Il core invariato del tuo framework)
     // =========================================================================
     std::vector<torch::jit::Value*> user_inputs = {
-        b_weights,
-        dataset_inputs_list,
-        dataset_targets_list,
-        loop_iter,
-        loop_cond_in
+        b_weights, in_dataset_inputs, in_dataset_targets, b_epoch_iter, loop_cond_in
     };
-
-    // CORREZIONE: Inlineamento dei nodi del sottografo direttamente dentro il blocco interno del loop
-    std::vector<torch::jit::Value*> uo = torch::jit::insertGraph(
-        *main_graph,
-        *user_step_subgraph,
-        user_inputs
-    );
-
-
+    std::vector<torch::jit::Value*> uo = torch::jit::insertGraph(*main_graph, *user_step_subgraph, user_inputs);
     std::vector<c10::TypePtr> user_expected_types = { c10::TensorType::get(), c10::BoolType::get() };
     auto user_outputs = extractTupleResult(uo[0], main_graph.get(), 2, user_expected_types);
-    torch::jit::Value* current_loss   = user_outputs[0];
-    torch::jit::Value* next_loop_cond = user_outputs[1];
+    torch::jit::Value* current_loss       = user_outputs[0];
+    torch::jit::Value* user_stopping_cond = user_outputs[1];
 
-    // BLINDARE I TIPI DEL BLOCCO UTENTE:
-    current_loss->setType(c10::TensorType::get());     // La loss deve essere un Tensor
-    next_loop_cond->setType(c10::BoolType::get());    // La condizione deve essere un Bool
-
-
-    // =========================================================================
-    // PASSO 2: GESTIONE INFRASTRUTTURALE DI aten::grad (All'interno di body)
-    // =========================================================================
+    // Autograd
     torch::jit::Node* outputs_list = main_graph->create(torch::jit::prim::ListConstruct, {current_loss});
-    body->appendNode(outputs_list); // Inserimento esplicito nel blocco corrente del loop
-
+    body->appendNode(outputs_list);
     torch::jit::Node* grad_node = main_graph->create(torch::jit::aten::grad, {
         outputs_list->output(), b_weights, none_val, none_val, none_val, main_graph->insertConstant(false)
     });
-    body->appendNode(grad_node); // Inserimento esplicito nel blocco corrente del loop
+    body->appendNode(grad_node);
     torch::jit::Value* computed_gradients = grad_node->output();
-    auto tensor_list_type = c10::ListType::create(c10::TensorType::get());
     computed_gradients->setType(tensor_list_type);
-    // computed_gradients->setType(c10::ListType::create(c10::TensorType::get())); // Forza il tipo della lista di gradienti
 
-    // =========================================================================
-    // PASSO 3: INNESTO DEL SOTTOGRAFO DELL'OTTIMIZZATORE (All'interno di body)
-    // =========================================================================
+    // Ottimizzatore
     std::vector<torch::jit::Value*> optimizer_inputs = {
-        b_weights,
-        computed_gradients,
-        b_lr,
-        b_m_list,
-        b_v_list,
-        loop_iter
+        b_weights, computed_gradients, b_lr, b_m_list, b_v_list, b_epoch_iter
     };
-
-    std::vector<torch::jit::Value*> oo = torch::jit::insertGraph(
-        *main_graph,
-        *optimizer_subgraph,
-        optimizer_inputs
-    );
-    // Specifichiamo che l'ottimizzatore restituisce: [Tensor[], float, Tensor[], Tensor[]]
-    std::vector<c10::TypePtr> optimizer_expected_types = {
-        tensor_list_type,       // next_weights_list
-        c10::FloatType::get(),  // next_lr
-        tensor_list_type,       // next_m_list
-        tensor_list_type        // next_v_list
-    };
+    std::vector<torch::jit::Value*> oo = torch::jit::insertGraph(*main_graph, *optimizer_subgraph, optimizer_inputs);
+    std::vector<c10::TypePtr> optimizer_expected_types = { tensor_list_type, c10::FloatType::get(), tensor_list_type, tensor_list_type };
     auto optimizer_outputs = extractTupleResult(oo[0], main_graph.get(), 4, optimizer_expected_types);
-
     torch::jit::Value* next_weights_list = optimizer_outputs[0];
     torch::jit::Value* next_lr           = optimizer_outputs[1];
     torch::jit::Value* next_m_list       = optimizer_outputs[2];
     torch::jit::Value* next_v_list       = optimizer_outputs[3];
 
+    // =========================================================================
+    // CALCOLO AVANZAMENTO EPOCHE ED AND LOGICO NATIVO
+    // =========================================================================
+    torch::jit::Node* next_epoch_node = main_graph->create(torch::jit::aten::add, {b_epoch_iter, int_one, int_one});
+    body->appendNode(next_epoch_node);
+    torch::jit::Value* next_epoch_val = next_epoch_node->output();
+    next_epoch_val->setType(c10::IntType::get());
+
+    torch::jit::Node* epoch_check_node = main_graph->create(torch::jit::aten::lt, {next_epoch_val, max_epochs_val});
+    body->appendNode(epoch_check_node);
+
+    torch::jit::Node* and_node = main_graph->create(torch::jit::aten::__and__, {epoch_check_node->output(), user_stopping_cond});
+    body->appendNode(and_node);
+    torch::jit::Value* next_loop_cond = and_node->output();
+    next_loop_cond->setType(c10::BoolType::get());
 
     // =========================================================================
-    // CHIUSURA REGISTRI (Dataflow allineato nel Loop)
+    // RI-IMPACCHETTAMENTO DELLE TUPLE DI USCITA (Esattamente 4 canali registrati!)
     // =========================================================================
-    // auto tensor_list_type = c10::ListType::create(c10::TensorType::get());
-    next_weights_list->setType(tensor_list_type);
-    next_lr->setType(c10::FloatType::get());
-    next_m_list->setType(tensor_list_type);
-    next_v_list->setType(tensor_list_type);
-    // -------------------------------------------------------------------------
-    // CHIUSURA REGISTRI DEL LOOP
-    // -------------------------------------------------------------------------
-    body->registerOutput(next_loop_cond);
-    body->registerOutput(next_weights_list);
-    body->registerOutput(next_lr);
-    body->registerOutput(next_m_list);
-    body->registerOutput(next_v_list);
-    // -------------------------------------------------------------------------
-    // CORREZIONE STRUTTURALE RADICE: Converte in Tupla singola per il salvataggio .pt
-    // -------------------------------------------------------------------------
+    torch::jit::Node* out_opt_tuple = main_graph->create(torch::jit::prim::TupleConstruct, {next_m_list, next_v_list});
+    body->appendNode(out_opt_tuple);
+
+    torch::jit::Node* out_hyper_tuple = main_graph->create(torch::jit::prim::TupleConstruct, {next_lr, next_epoch_val});
+    body->appendNode(out_hyper_tuple);
+
+    // Registrazione speculare millimetrica con block0
+    body->registerOutput(next_loop_cond);       // Mappa su loop_cond_in
+    body->registerOutput(next_weights_list);   // Mappa su b_weights
+    body->registerOutput(out_opt_tuple->output());   // Mappa su b_opt_tuple
+    body->registerOutput(out_hyper_tuple->output()); // Mappa su b_hyper_tuple
+
+    // Estrazione finale all'esterno del ciclo
     torch::jit::Value* final_weights_out = loop_node->output(0);
-    final_weights_out->setType(c10::ListType::create(c10::TensorType::get()));
-    // torch::jit::Node* tuple_node = main_graph->create(torch::jit::prim::TupleConstruct, {final_weights_out});
-    // main_graph->insertNode(tuple_node);
+    final_weights_out->setType(tensor_list_type);
     main_graph->registerOutput(final_weights_out);
+
+    return main_graph;
 }

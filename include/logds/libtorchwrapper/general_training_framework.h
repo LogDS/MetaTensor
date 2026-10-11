@@ -33,13 +33,11 @@ std::shared_ptr<torch::jit::Graph> create_parametrizable_optimizer_subgraph(
     int64_t decay_steps_init = 10
 );
 
-void build_universal_training_pipeline(
-    std::shared_ptr<torch::jit::Graph>& main_graph,
-    const std::vector<torch::jit::Value*>& dataset_inputs_vector,
-    const std::vector<torch::jit::Value*>& dataset_targets_vector,
-    const std::vector<torch::jit::Value*>& initial_weights,
+
+std::shared_ptr<torch::jit::Graph> build_universal_training_pipeline(
     std::shared_ptr<torch::jit::Graph> user_step_subgraph,
     std::shared_ptr<torch::jit::Graph> optimizer_subgraph,
+    size_t num_tensors, // CORREZIONE: Numero di tensori passato esplicitamente per l'unrolling
     int max_epochs,
     float initial_lr
 );

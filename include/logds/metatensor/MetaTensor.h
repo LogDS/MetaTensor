@@ -436,16 +436,127 @@ public:
         return helper_return<target_shape>(out, std::make_index_sequence<2>{});
     }
 
-    // 10. Multi-Dimensional Gather (Gather ND) - RIPARATO: Riceve MetaTensor di indici
+    // // 10. Multi-Dimensional Gather (Gather ND) - RIPARATO: Riceve MetaTensor di indici
+    // template <typename IndexTensorT>
+    // auto gather_nd(const IndexTensorT& indices) const {
+    //     static_assert(Rank == 2, "[ERR_RANK] Gather ND richiede sorgente matriciale 2D.");
+    //     constexpr size_t NumIndices = IndexTensorT::Shape[0];
+    //
+    //     auto gathered = this->to_dense().storage.index({indices.storage.select(1, 0).to(torch::kInt64),
+    //                                                    indices.storage.select(1, 1).to(torch::kInt64)});
+    //
+    //     return MetaTensor<T, StorageLayout::Dense, NumIndices>(gathered);
+    // }
+
+    // =============================================================================
+    // 10. MULTI-DIMENSIONAL GATHER (Gather ND) GENERALIZZATO UNIVERSALE
+    // =============================================================================
+    // Estrae fette o celle da una sorgente di rango qualsiasi usando un tensore multi-indice.
+    // Vincoli statici: la profondità dell'indice (ultimo asse) non può superare il Rank sorgente.
     template <typename IndexTensorT>
     auto gather_nd(const IndexTensorT& indices) const {
-        static_assert(Rank == 2, "[ERR_RANK] Gather ND richiede sorgente matriciale 2D.");
-        constexpr size_t NumIndices = IndexTensorT::Shape[0];
 
-        auto gathered = this->to_dense().storage.index({indices.storage.select(1, 0).to(torch::kInt64),
-                                                       indices.storage.select(1, 1).to(torch::kInt64)});
+        constexpr size_t IdxRank = IndexTensorT::Rank;
+        constexpr size_t IdxDepth = IndexTensorT::Shape[IdxRank - 1]; // K
 
-        return MetaTensor<T, StorageLayout::Dense, NumIndices>(gathered);
+        static_assert(IdxDepth <= Rank,
+            "[ERR_GATHER_ND] La profondità dell'indice (K) supera il rango geometrico del MetaTensor sorgente.");
+
+        auto dense_indices = indices.to_dense().storage;
+        auto indices_permuted = dense_indices.unbind(-1);
+
+        // RISOLUTIVO: Vettore tipizzato esplicito per l'Advanced Indexing di LibTorch
+        std::vector<at::indexing::TensorIndex> index_expr;
+        index_expr.reserve(IdxDepth);
+        for (size_t i = 0; i < IdxDepth; ++i) {
+            index_expr.push_back(indices_permuted[i].to(torch::kLong));
+        }
+
+        // Ora la chiamata mappa perfettamente la firma ArrayRef<at::indexing::TensorIndex>
+        auto gathered_storage = this->to_dense().storage.index(index_expr);
+
+        constexpr size_t OutRank = (IdxRank - 1) + (Rank - IdxDepth);
+
+        auto compute_out_shape = []() {
+            std::array<size_t, (OutRank > 0 ? OutRank : 1)> out_dims{};
+            size_t ptr = 0;
+
+            for (size_t i = 0; i < IdxRank - 1; ++i) {
+                out_dims[ptr++] = IndexTensorT::Shape[i];
+            }
+            for (size_t i = IdxDepth; i < Rank; ++i) {
+                out_dims[ptr++] = Shape[i];
+            }
+            return out_dims;
+        };
+
+        constexpr auto out_shape = compute_out_shape();
+
+        return helper_instantiate<out_shape>(gathered_storage, std::make_index_sequence<OutRank>{});
+    }
+
+
+    // =============================================================================
+    // EQUIVALENTE tf.reshape: STRONGLY-TYPED VIEW INJECTION
+    // =============================================================================
+    // Consente di rimappare gli assi geometrici del tensore.
+    // Vincolo statico: Il volume totale degli elementi deve rimanere invariato!
+    template <size_t... NewDims>
+    auto reshape() const {
+        constexpr size_t OriginalVolume = (Dims * ... * 1);
+        constexpr size_t NewVolume = (NewDims * ... * 1);
+
+        static_assert(OriginalVolume == NewVolume,
+            "[ERR_RESHAPE_VOLUME] Il volume totale degli elementi del nuovo layout non coincide con quello originario!");
+
+        // Applichiamo la trasformazione a costo zero tramite un reshape/view dell'hardware
+        auto reshaped_storage = this->to_dense().storage.reshape({static_cast<int64_t>(NewDims)...});
+
+        // Generiamo il nuovo tipo statico MetaTensor avente le nuove dimensioni
+        return MetaTensor<T, StorageLayout::Dense, NewDims...>(reshaped_storage);
+    }
+
+    // =============================================================================
+    // EQUIVALENTE tf.stack: VARIADIC PACK CONCATENATION (Risoluzione Rango Statico)
+    // =============================================================================
+    template <size_t Axis = 0, typename... OtherMetaTensors>
+    auto stack(const OtherMetaTensors&... others) const {
+
+        constexpr size_t NumTensors = 1 + sizeof...(OtherMetaTensors);
+        static_assert(NumTensors >= 2, "[ERR_STACK] È necessario fornire almeno due tensori per eseguire lo stacking.");
+
+        // Vincolo statico di Tipo e Forma: Tutti i tensori inseriti devono condividere lo stesso metatipo
+        static_assert((std::is_same_v<MetaTensor<T, Layout, Dims...>, OtherMetaTensors> && ...),
+            "[ERR_STACK_TYPE] Tutti i tensori passati al pacchetto di stacking devono avere la stessa identica firma geometrica e di tipo.");
+
+        static_assert(Axis <= Rank, "[ERR_STACK_BOUNDS] L'asse di inserimento dello stack supera il rango massimo consentito.");
+
+        // Raccogliamo i buffer fisici di ATen in un vettore per l'operatore core di LibTorch
+        std::vector<torch::Tensor> torch_tensors = { this->storage };
+        (torch_tensors.push_back(others.storage), ...);
+
+        // Invocazione sincrona bare-metal sul chip grafico
+        auto stacked_storage = torch::stack(torch_tensors, static_cast<int64_t>(Axis));
+
+        // Calcolo constexpr della nuova Shape dell'array NTTP inserendo 'NumTensors' nella posizione 'Axis'
+        constexpr size_t NewRank = Rank + 1;
+        auto compute_stacked_shape = []() {
+            std::array<size_t, NewRank> out_dims{};
+            size_t src_ptr = 0;
+            for (size_t i = 0; i < NewRank; ++i) {
+                if (i == Axis) {
+                    out_dims[i] = NumTensors;
+                } else {
+                    out_dims[i] = Shape[src_ptr++];
+                }
+            }
+            return out_dims;
+        };
+
+        constexpr auto out_shape = compute_stacked_shape();
+
+        // RISOLUTIVO: Delega lo srotolamento variadic a helper_instantiate passandogli l'array per valore
+        return helper_instantiate<out_shape>(stacked_storage, std::make_index_sequence<NewRank>{});
     }
 
 

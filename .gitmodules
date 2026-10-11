@@ -16,3 +16,6 @@
 [submodule "submodules/pytorch"]
 	path = submodules/pytorch
 	url = https://github.com/pytorch/pytorch.git
+[submodule "submodules/rva"]
+	path = submodules/rva
+	url = https://github.com/codeinred/recursive-variant
