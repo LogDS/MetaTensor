@@ -725,3 +725,31 @@ TEST_CASE("Runtime: Validazione Reshape e Stack Strongly-Typed", "[reshape_stack
         t0.clear(); t1.clear(); t2.clear(); Stacked.clear();
     }
 }
+
+TEST_CASE("Runtime: Validazione Meshgrid Strongly-Typed", "[meshgrid]") {
+    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+
+    // Creiamo due vettori di coordinate 1D con dimensioni diverse (assi disgiunti)
+    MetaTensor<float, StorageLayout::Dense, 3> vec_x(device, InitPattern::RandomNormal); // es: asse X con 3 elementi
+    MetaTensor<float, StorageLayout::Dense, 5> vec_y(device, InitPattern::RandomNormal); // es: asse Y con 5 elementi
+
+    // 1. GENERAZIONE DELLA GRIGLIA CARTESIANA 2D VIA MULTI-DISPATCHING STATICO
+    auto [GridX, GridY] = MetaTensor<float, StorageLayout::Dense>::meshgrid(vec_x, vec_y);
+
+    // 2. VERIFICA DEI METATIPI A TEMPO DI COMPILAZIONE (Rango N=2, Forma)
+    STATIC_REQUIRE(decltype(GridX)::Rank == 2);
+    STATIC_REQUIRE(decltype(GridY)::Rank == 2);
+
+    STATIC_REQUIRE(decltype(GridX)::Shape[0] == 3);
+    STATIC_REQUIRE(decltype(GridX)::Shape[1] == 5);
+    STATIC_REQUIRE(decltype(GridY)::Shape[0] == 3);
+    STATIC_REQUIRE(decltype(GridY)::Shape[1] == 5);
+
+    // 3. VERIFICA HARDWARE DEL GRAFO DI LIBTORCH NATIVO
+    REQUIRE(GridX.storage.size(0) == 3);
+    REQUIRE(GridX.storage.size(1) == 5);
+    REQUIRE(GridY.storage.size(0) == 3);
+    REQUIRE(GridY.storage.size(1) == 5);
+
+    vec_x.clear(); vec_y.clear(); GridX.clear(); GridY.clear();
+}

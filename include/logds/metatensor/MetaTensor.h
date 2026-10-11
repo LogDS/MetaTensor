@@ -495,6 +495,50 @@ public:
         return helper_instantiate<out_shape>(gathered_storage, std::make_index_sequence<OutRank>{});
     }
 
+        // =============================================================================
+    // EQUIVALENTE tf.meshgrid: CARTESIAN COORDINATE SPACE GENERATOR
+    // =============================================================================
+    // Prende un pacchetto variadic di vettori 1D e genera una tupla di MetaTensor N-D
+    // rappresentanti la griglia di coordinate cartesiane incrociate.
+    // Esempio: auto [X, Y] = MetaTensor<float, Dense>::meshgrid(vett_x, vett_y);
+    // =============================================================================
+    // EQUIVALENTE tf.meshgrid: CARTESIAN COORDINATE SPACE GENERATOR (Riparato)
+    // =============================================================================
+    // =============================================================================
+    // EQUIVALENTE tf.meshgrid: CARTESIAN COORDINATE SPACE GENERATOR (Risolto GCC-12)
+    // =============================================================================
+    template <typename... Vectors>
+    static auto meshgrid(const Vectors&... vectors) {
+
+        // 1. VALIDAZIONE STATICA DELLE FIRME D'INGRESSO (Parentesi tonde corrette per la Fold)
+        static_assert(sizeof...(Vectors) >= 2,
+            "[ERR_MESHGRID] È necessario fornire almeno due vettori per generare una griglia cartesiana.");
+
+        static_assert(((std::decay_t<Vectors>::Rank == 1) && ...),
+            "[ERR_MESHGRID_RANK] Tutti gli operandi di input di meshgrid devono essere vettori unidimensionali (Rank == 1).");
+
+        constexpr size_t N = sizeof...(Vectors);
+
+        // RISOLUTIVO: Accesso posizionale all'indice 0 dell'array statico Shape di ciascun vettore
+        constexpr std::array<size_t, N> grid_shape = { (std::decay_t<Vectors>::Shape[0])... };
+
+        // 2. ESTRAZIONE DEI BUFFER ATEN E CHIAMATA HARDWARE
+        std::vector<torch::Tensor> torch_inputs = { vectors.storage... };
+
+        // Invocazione bare-metal di LibTorch con indicizzazione canonica "ij"
+        std::vector<torch::Tensor> torch_outputs = torch::meshgrid(torch_inputs, "ij");
+
+        // 3. GENERAZIONE DELLA TUPLA DI OUTPUT FORTEMENTE TIPIZZATA
+        auto instantiate_grid_tuple = [&]<size_t... Is>(std::index_sequence<Is...>) {
+            return std::make_tuple(
+                MetaTensor<T, StorageLayout::Dense, grid_shape[Is]...>(torch_outputs[Is])...
+            );
+        };
+
+        return instantiate_grid_tuple(std::make_index_sequence<N>{});
+    }
+
+
 
     // =============================================================================
     // EQUIVALENTE tf.reshape: STRONGLY-TYPED VIEW INJECTION
